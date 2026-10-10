@@ -198,7 +198,7 @@ def test_pack_and_community_commands_work_end_to_end(tmp_path, monkeypatch, caps
     monkeypatch.setattr(packs.asyncio, "sleep", lambda seconds: _nothing())
 
     urls = tmp_path / "urls.txt"
-    urls.write_text("# my list\nhttps://one.example/a\nhttps://two.example/b\n")
+    urls.write_text("# my list\nhttps://one-example.org/a\nhttps://two-example.org/b\n")
     out = tmp_path / "demo.pack"
     assert cli.main(["pack", "build", "demo"]) == 1  # no licence, no pack
     assert cli.main(["pack", "build", "demo", "--urls", str(urls), "--title", "Demo", "--licence", "CC0-1.0",
@@ -211,15 +211,15 @@ def test_pack_and_community_commands_work_end_to_end(tmp_path, monkeypatch, caps
     assert cli.main(["pack", "remove", "demo"]) == 0 and packs.installed() == []
 
     store = LocalIndex(default_path())
-    for url in ("https://one.example/a", "https://two.example/b", "https://wiki.corp/private"):
+    for url in ("https://one-example.org/a", "https://two-example.org/b", "https://wiki.corp/private"):
         store.add(Document(url, "Title", text, None, "plain", False))
     store.close()
     mine, theirs, chosen = tmp_path / "mine.txt", tmp_path / "theirs.txt", tmp_path / "chosen.txt"
     assert cli.main(["community", "export", str(mine)]) == 0
-    assert sorted(mine.read_text().split()) == ["https://one.example/a", "https://two.example/b"]
-    theirs.write_text("https://one.example/a\n")
+    assert sorted(mine.read_text().split()) == ["https://one-example.org/a", "https://two-example.org/b"]
+    theirs.write_text("https://one-example.org/a\n")
     assert cli.main(["community", "select", str(mine), str(theirs), "--output", str(chosen)]) == 0
-    assert chosen.read_text().split() == ["https://one.example/a"]
+    assert chosen.read_text().split() == ["https://one-example.org/a"]
     release = tmp_path / "release"
     assert cli.main(["community", "build", str(chosen), "--name", "pilot", "--licence", "CC0-1.0",
                      "--attribution", "Us", "--output", str(release)]) == 0

@@ -557,11 +557,17 @@ def cmd_community(args) -> int:
                 print("The local index is empty; there is nothing to propose.")
                 return 0
             store = index.LocalIndex()
+            ranks = authority.Authority()
             try:
-                count = community.export_nominations(store, Path(args.paths[0]).expanduser(), args.limit)
+                count = community.export_nominations(store, Path(args.paths[0]).expanduser(), args.limit, ranks)
             finally:
                 store.close()
-            print(f"Wrote {count} addresses to {args.paths[0]}. Nothing was sent anywhere; share the file if you choose to.")
+            print(f"Wrote {count} addresses to {args.paths[0]}. Nothing was sent anywhere.")
+            print("Only plain pages on public sites are listed, but an address can still be personal to you:")
+            print("read the file before you share it. Domains in WEB_EXPRESS_PRIVATE_DOMAINS are always left out.")
+            if not ranks.available:
+                print("Tip: with site-ranking data installed (web-express authority install), only pages on "
+                      "publicly well-linked sites are listed.")
         elif args.action == "select":
             if not args.output:
                 print("community select needs --output.", file=sys.stderr)
@@ -591,7 +597,7 @@ def cmd_community(args) -> int:
             print(f"Built {len(result['shards'])} shards, {result['pages']} pages, {result['unreadable']} unreadable. "
                   f"Manifest: {Path(args.output).expanduser() / 'manifest.json'}")
         elif args.action == "install":
-            names = community.install_from_manifest(Path(args.paths[0]).expanduser())
+            names = community.install_from_manifest(Path(args.paths[0]).expanduser(), replace=args.replace)
             print(f"Installed {len(names)} shards: {', '.join(names)}")
     except (community.CommunityError, packs.PackError, OSError) as exc:
         print(f"community {args.action} failed: {exc}", file=sys.stderr)
@@ -662,6 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
     shared.add_argument("--licence", default="")
     shared.add_argument("--attribution", default="")
     shared.add_argument("--shard-size", type=int, default=1000)
+    shared.add_argument("--replace", action="store_true", help="install: replace installed packs of the same names")
     return parser
 
 

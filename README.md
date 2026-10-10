@@ -132,20 +132,32 @@ The long-term aim is an open index anyone can download, built by its users.
 The tooling for that is here; no shared index has been published yet.
 
 1. `web-express community export mine.txt` writes addresses from your local
-   index to a file. Addresses only: no searches, dates or page text, and never
-   one that carries a credential or points inside a private network. Nothing is
-   sent anywhere; you choose whether to share the file.
+   index to a file. Nothing is sent anywhere. Only plain https pages on public
+   sites are listed: nothing with a query string, nothing that looks like a
+   search, login, reset, share or account page, nothing with a long
+   random-looking part in its path, and nothing on a domain you list in
+   `WEB_EXPRESS_PRIVATE_DOMAINS`. With site-ranking data installed, only pages
+   on well-linked public sites are listed. An address can still be personal to
+   you, so read the file before sharing it.
 2. `web-express community select a.txt b.txt c.txt --output chosen.txt` keeps
-   addresses proposed by several contributors, from well-linked sites, with a
-   cap per site.
+   addresses proposed in several distinct files, from well-linked sites, with a
+   cap per site (subdomains counted together). `--blocked FILE` applies
+   takedowns: a site, or a page and everything under it.
 3. `web-express community build chosen.txt --name pilot --licence ... --attribution ... --output release/`
    fetches and embeds every page itself, cuts the result into shards, and
    writes a manifest with each shard's checksum.
-4. `web-express community install release/manifest.json` installs the shards,
-   refusing any that does not match the manifest.
+4. `web-express community install release/manifest.json` installs all the
+   shards or none: each must match its checksum, be a valid pack, and carry
+   the name the manifest gives it.
 
 Contributors propose addresses, never content, so nobody can plant text or
 vectors in the index.
+
+Known limits. The several-contributors rule stops accidents and casual abuse,
+not one determined person posing as several: that needs contributor
+identities, which this tooling does not have. Builds are not bit-for-bit
+repeatable, because pages change between fetches; the manifest proves what the
+builder published, not that anyone would have built the same.
 
 ## Settings
 
@@ -157,6 +169,7 @@ vectors in the index.
 | `WEB_EXPRESS_INDEX` | `off` disables the local index. |
 | `WEB_EXPRESS_MAX_AGE_DAYS` | Days a stored page is served before it is fetched again. Default 7. |
 | `WEB_EXPRESS_MAX_PAGES` | Pages kept in the index. Default 20000. |
+| `WEB_EXPRESS_PRIVATE_DOMAINS` | Comma-separated domains never included in a community export. |
 | `WEB_EXPRESS_GITHUB_TOKEN` | Optional free token; raises GitHub's search limit. |
 | `WEB_EXPRESS_OPENALEX_KEY` | Optional free key; raises OpenAlex's daily allowance. |
 

@@ -332,17 +332,16 @@ def _download(source: str, target: Path, transport: httpx.BaseTransport | None) 
         raise PackError(f"Could not download the pack ({type(exc).__name__}).") from exc
 
 
-def install(source: str, sha256: str | None = None, transport: httpx.BaseTransport | None = None,
-            replace: bool = False) -> dict:
-    """Install a pack from a file path or an https address. Returns its details.
+def prepare(source: str, sha256: str | None = None, transport: httpx.BaseTransport | None = None) -> tuple[dict, Path]:
+    """Fetch, verify and convert a pack without installing it. Returns (details, path of the converted file).
 
-    sha256, if given, must match the file as it arrives. An installed pack of the
-    same name is left alone unless replace is set.
+    The caller must pass the path to commit() or delete it.
     """
     folder = packs_dir()
     folder.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex[:8]
     staging, converted = folder / f".incoming-{token}", folder / f".converted-{token}"
+    done = False
     try:
         if re.match(r"https?://", source):
             _download(source, staging, transport)
@@ -357,15 +356,44 @@ def install(source: str, sha256: str | None = None, transport: httpx.BaseTranspo
         if sha256 and actual != sha256.strip().lower():
             raise PackError("The pack does not match the checksum you gave; it was not installed.")
         info = _import(staging, converted)
-        destination = folder / f"{info['name']}.sqlite3"
-        if destination.exists() and not replace:
-            raise PackError(f"A pack named {info['name']} is already installed. Remove it first, or install with replace.")
-        os.replace(converted, destination)
-        return {**info, "sha256": actual, "file": str(destination)}
+        done = True
+        return {**info, "sha256": actual}, converted
     finally:
-        for leftover in (staging, converted, converted.with_name(converted.name + "-wal"),
-                         converted.with_name(converted.name + "-shm"), converted.with_name(converted.name + "-journal")):
-            leftover.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
+        if not done:
+            discard(converted)
+
+
+def discard(converted: Path) -> None:
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        converted.with_name(converted.name + suffix).unlink(missing_ok=True)
+
+
+def destination(name: str) -> Path:
+    return packs_dir() / f"{_check_name(name)}.sqlite3"
+
+
+def commit(info: dict, converted: Path, replace: bool = False) -> dict:
+    """Move a prepared pack into place. An installed pack of the same name is kept unless replace is set."""
+    target = destination(info["name"])
+    try:
+        if target.exists() and not replace:
+            raise PackError(f"A pack named {info['name']} is already installed. Remove it first, or install with replace.")
+        os.replace(converted, target)
+    finally:
+        discard(converted)
+    return {**info, "file": str(target)}
+
+
+def install(source: str, sha256: str | None = None, transport: httpx.BaseTransport | None = None,
+            replace: bool = False) -> dict:
+    """Install a pack from a file path or an https address. Returns its details.
+
+    sha256, if given, must match the file as it arrives. An installed pack of the
+    same name is left alone unless replace is set.
+    """
+    info, converted = prepare(source, sha256, transport)
+    return commit(info, converted, replace)
 
 
 def installed() -> list[Pack]:
@@ -373,7 +401,7 @@ def installed() -> list[Pack]:
     folder = packs_dir()
     packs = []
     if folder.is_dir():
-        for path in sorted(folder.glob("*.sqlite3")):
+        for path in sorted(p for p in folder.glob("*.sqlite3") if not p.name.startswith(".")):
             try:
                 packs.append(Pack(path))
             except PackError:
