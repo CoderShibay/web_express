@@ -11,8 +11,13 @@ async def isolated(tmp_path, monkeypatch):
     embed.reset()
     monkeypatch.setattr(server, "_index", None)
     monkeypatch.setattr(server, "_index_failed", False)
+    monkeypatch.setattr(server, "_packs", [])
+    monkeypatch.setattr(server, "_packs_seen", None)
+    monkeypatch.setattr(server, "_authority", None)
     yield
     await server.flush()
     if server._index is not None:
         server._index.close()
+    for pack in server._packs:
+        pack.close()
     embed.reset()

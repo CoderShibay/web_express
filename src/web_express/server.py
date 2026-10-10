@@ -17,7 +17,8 @@ try:  # mcp 2.x renamed FastMCP to MCPServer; support both
 except ImportError:
     from mcp.server.fastmcp import FastMCP
 
-from . import embed
+from . import embed, packs
+from .authority import Authority
 from .cache import TTLCache
 from .extract import Document, extract
 from .federation import FRESHNESS_DAYS, Federation, Outcome, fuse
@@ -33,6 +34,7 @@ log = logging.getLogger("web_express")
 PAGE_TIMEOUT = 12.0  # per page, when search reads pages on the caller's behalf
 RERANK_POOL = 30  # merged results considered before the best max_results are kept
 LOCAL_RESULTS = 8  # pages the local index may add to a search
+PACK_RESULTS = 5  # pages each installed pack may add to a search
 FETCH_TIMEOUT = TOTAL_TIMEOUT + 10.0  # download plus extraction, for an explicit fetch
 
 server = FastMCP(
@@ -57,6 +59,9 @@ _background: set = set()
 _index: LocalIndex | None = None
 _index_failed = False
 _index_lock = threading.Lock()
+_packs: list = []
+_packs_seen: float | None = None  # modification time of the packs folder when _packs was loaded
+_authority: Authority | None = None
 
 
 def _max_age() -> float:
@@ -100,6 +105,34 @@ def _stored(url: str, max_age: float | None):
     except sqlite3.Error as exc:
         _index_failure(exc)
         return None
+
+
+def _get_packs() -> list:
+    """Installed packs, reloaded when the packs folder changes."""
+    global _packs, _packs_seen
+    folder = packs.packs_dir()
+    try:
+        seen = folder.stat().st_mtime if folder.is_dir() else 0.0
+    except OSError:
+        seen = 0.0
+    with _index_lock:
+        if seen != _packs_seen:
+            for old in _packs:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            _packs = packs.installed() if seen else []
+            _packs_seen = seen
+        return list(_packs)
+
+
+def _get_authority() -> Authority:
+    global _authority
+    with _index_lock:
+        if _authority is None:
+            _authority = Authority()
+        return _authority
 
 
 def _model_id(embedder) -> str:
@@ -212,6 +245,37 @@ def _local_hits(query: str, since: date | None) -> list[Hit]:
     return hits
 
 
+def _pack_hits(query: str, since: date | None) -> list[Hit]:
+    """Pages from installed corpus packs that match the query."""
+    hits = []
+    embedder = embed.get_embedder()
+    try:
+        vector, model = (embedder.embed([query])[0], _model_id(embedder)) if embedder else (None, None)
+    except Exception:
+        vector, model = None, None
+    for pack in _get_packs():
+        try:
+            pages = pack.search(query, PACK_RESULTS, vector, model)
+        except Exception as exc:
+            log.warning("pack %s could not be searched: %s", pack.name, exc)
+            continue
+        for page in pages:
+            if since and (not page.published or page.published < since.isoformat()):
+                continue
+            hits.append(Hit(page.title, page.url, _clip(page.text), f"pack:{pack.name}", page.published, page.text))
+    return hits
+
+
+def _pack_credit(sources: list[str]) -> dict | None:
+    """Licence and attribution of the first pack among a result's sources."""
+    names = [s.removeprefix("pack:") for s in sources if s.startswith("pack:")]
+    for pack in _get_packs():
+        if pack.name in names:
+            return {"pack": pack.info.get("title") or pack.name, "licence": pack.info.get("licence", ""),
+                    "attribution": pack.info.get("attribution", "")}
+    return None
+
+
 def _copy(hit: Hit) -> Hit:
     """A copy safe to merge: merging edits hits, and cached answers must stay as they were."""
     extra = {k: (list(v) if isinstance(v, list) else v) for k, v in hit.extra.items()}
@@ -264,7 +328,9 @@ def _rerank(query: str, hits: list[Hit]) -> list[Hit]:
     if embedder is None:
         return hits
     texts = [f"{h.title}. {(h.snippet or h.content or '')[:400]}" for h in hits]
-    return [hits[i] for i in rerank(query, texts, embedder)]
+    authority = _get_authority()
+    bonus = [authority.bonus(h.url) for h in hits] if authority.available else None
+    return [hits[i] for i in rerank(query, texts, embedder, bonus)]
 
 
 def _ranking_note() -> str:
@@ -278,14 +344,20 @@ async def _result(query: str, hit: Hit, contents: bool, highlights: int, include
         result["published"] = hit.published
     details = {k: v for k, v in hit.extra.items() if k != "sources" and v not in (None, "", [])}
     result["sources"] = hit.extra.get("sources", [hit.source])
+    site_rank = _get_authority().position(hit.url)
+    if site_rank is not None:
+        details["site_rank"] = site_rank  # 1 is the best-linked site on the web
     if details:
         result["details"] = details
+    credit = _pack_credit(result["sources"])
+    if credit:
+        result["pack"] = credit
     if not contents:
         return result
     try:
         if hit.content and "local" not in result["sources"]:
             result["highlights"] = await asyncio.to_thread(_from_source, query, hit.content, highlights)
-            result["content_from"] = "source"
+            result["content_from"] = "pack" if credit else "source"
             result["total_chars"] = len(hit.content)
             return result
         document = await _load(hit.url, timeout=PAGE_TIMEOUT)
@@ -328,7 +400,9 @@ async def search(
     the query, quoted verbatim. When `content_from` is "page", highlights carry
     character offsets (pass `start` to fetch to read on from there); when it is
     "source", the text came from the source's own data (a paper's abstract, a
-    Stack Overflow answer). A result that could not be read has `content_error`.
+    Stack Overflow answer); when it is "pack", from an installed corpus pack,
+    whose licence and attribution are given in `pack`. A result that could not
+    be read has `content_error`.
     `source_errors` lists sources that did not answer. `ranking` says whether
     results and passages were ranked by meaning ("semantic") or by keywords only,
     which happens until the small local model has finished its one-time download.
@@ -373,10 +447,11 @@ async def search(
             (_partial_cache if outcome.errors else _search_cache).set(key, outcome)
     since = date.today() - timedelta(days=FRESHNESS_DAYS[freshness]) if freshness else None
     local = await asyncio.to_thread(_local_hits, query, since)
-    if not outcome.used and outcome.errors and not local:
+    packed = await asyncio.to_thread(_pack_hits, query, since)
+    if not outcome.used and outcome.errors and not local and not packed:
         raise RuntimeError("No search source answered: " + " ".join(outcome.errors.values()))
 
-    merged = fuse([[_copy(h) for h in outcome.hits], local]) if local else outcome.hits
+    merged = fuse([[_copy(h) for h in outcome.hits], local, packed]) if local or packed else outcome.hits
     hits = [h for h in merged if _allowed(h.url, include, exclude)][:RERANK_POOL]
     hits = (await asyncio.to_thread(_rerank, query, hits))[:max_results]
     results = list(await asyncio.gather(
@@ -385,7 +460,7 @@ async def search(
     response = {
         "query": query,
         "categories": outcome.categories,
-        "sources_used": outcome.used + (["local"] if local else []),
+        "sources_used": outcome.used + (["local"] if local else []) + sorted({h.source for h in packed}),
         "cached": cached,
         "ranking": _ranking_note(),
         "count": len(results),

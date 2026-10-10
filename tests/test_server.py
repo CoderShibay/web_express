@@ -313,3 +313,49 @@ async def test_the_index_can_be_switched_off(setup, monkeypatch):
     await server._load("https://w.test/pizza")
     await server.flush()
     assert server._get_index() is None
+
+
+async def test_installed_packs_are_searched_and_credited(setup, tmp_path):
+    from tests.test_packs import make
+    from web_express import packs
+
+    built = await make(tmp_path)
+    packs.install(built["file"])
+    web = Fake("web1", ("web",), [Hit("Blog", "https://w.test/a", source="web1")])
+    loads = setup([web], {"https://w.test/a": doc("https://w.test/a", "queue tasks blog post")})
+    out = await server.search("queue between tasks")
+    assert "pack:test-docs" in out["sources_used"]
+    packed = next(r for r in out["results"] if r["url"] == "https://docs.test/b")
+    assert packed["content_from"] == "pack" and "queue" in packed["highlights"][0]["text"]
+    assert packed["pack"] == {"pack": "Test docs", "licence": "CC0-1.0", "attribution": "The Test Project"}
+    assert "https://docs.test/b" not in loads  # served from the pack, nothing fetched
+
+    packs.remove("test-docs")  # the folder changed: the pack disappears from the next search
+    out = await server.search("queue between tasks again")
+    assert "pack:test-docs" not in out["sources_used"]
+
+
+async def test_site_authority_adds_a_rank_and_a_small_preference(setup, tmp_path, monkeypatch):
+    import sqlite3
+
+    from tests.test_ranking import FakeEmbedder
+    from web_express.authority import Authority
+
+    path = tmp_path / "authority.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE domains (domain TEXT PRIMARY KEY, position INTEGER NOT NULL) WITHOUT ROWID")
+    db.execute("CREATE TABLE info (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute("INSERT INTO domains VALUES ('trusted.test', 3)")
+    db.commit()
+    db.close()
+    monkeypatch.setattr(server, "_authority", Authority(path))
+    monkeypatch.setattr(server.embed, "get_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(server.embed, "status", lambda: "ready")
+    # Two equally relevant results: the unknown site arrives first, the well-linked one second.
+    hits = [Hit("Cancel a task", "https://unknown.test/a", source="web1"), Hit("Cancel a task", "https://docs.trusted.test/b", source="web1")]
+    setup([Fake("web1", ("web",), hits)])
+    monkeypatch.setattr(server, "_authority", Authority(path))
+    monkeypatch.setattr("web_express.ranking.ORDER_BONUS", 0.01)
+    out = await server.search("cancel", contents=False)
+    assert [r["url"] for r in out["results"]] == ["https://docs.trusted.test/b", "https://unknown.test/a"]
+    assert out["results"][0]["details"] == {"site_rank": 3} and "details" not in out["results"][1]

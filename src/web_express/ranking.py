@@ -63,14 +63,16 @@ def best_passages(query: str, text: str, limit: int, embedder=None) -> list[Pass
     return [passages[-i] for _, i in scored[:limit]]
 
 
-def rerank(query: str, texts: list[str], embedder=None) -> list[int]:
+def rerank(query: str, texts: list[str], embedder=None, bonus: list[float] | None = None) -> list[int]:
     """Order of texts (indexes, best first) after blending their given order with meaning.
 
-    texts arrive in their current rank order. Without an embedder the order is unchanged.
+    texts arrive in their current rank order. bonus, if given, adds a small amount per
+    text (for example for a well-linked site). Without an embedder the order is unchanged.
     """
     count = len(texts)
     if embedder is None or count < 2:
         return list(range(count))
     similarity = _similarities(embedder.embed([query] + texts))
-    score = [similarity[i] + ORDER_BONUS * (1 - i / (count - 1)) for i in range(count)]
+    extra = bonus if bonus is not None and len(bonus) == count else [0.0] * count
+    score = [similarity[i] + ORDER_BONUS * (1 - i / (count - 1)) + extra[i] for i in range(count)]
     return sorted(range(count), key=lambda i: (-score[i], i))
