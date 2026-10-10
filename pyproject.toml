@@ -21,6 +21,10 @@ dependencies = [
     "tld>=0.13",
 ]
 
+[project.urls]
+Homepage = "https://github.com/CoderShibay/web_express"
+Issues = "https://github.com/CoderShibay/web_express/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
 

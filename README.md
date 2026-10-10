@@ -7,8 +7,9 @@ One `search` call returns the results **and** the passages of each page that
 match the query, quoted verbatim with character offsets, so an agent rarely
 needs a second call to read a page.
 
-> Status: early. The tooling for all seven steps of the plan below is built.
-> No pack or shared index has been published yet. It is not yet published
+> Status: early (0.1.0). The tooling for all seven steps of the plan below is
+> built. It is not on a package index yet, and no pack or shared index has been
+> published. It is not yet published
 > to a package index, so install from a copy of this folder.
 
 ## Tools
@@ -40,9 +41,11 @@ as information, never as instructions.
 
 ## Install
 
-Requires Python 3.11 or newer. From a copy of this folder:
+Requires Python 3.11 or newer.
 
 ```bash
+git clone https://github.com/CoderShibay/web_express.git
+cd web_express
 sh install.sh                                              # macOS, Linux
 powershell -ExecutionPolicy Bypass -File install.ps1       # Windows
 ```
