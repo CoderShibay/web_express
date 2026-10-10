@@ -6,8 +6,10 @@ fetches come from search results and from web pages. So every download:
 - resolves the host once, refuses anything that is not a public address, and
   connects to that exact address (a second DNS answer cannot redirect it);
 - re-checks every redirect hop the same way;
+- ignores proxy settings from the environment, which would bypass that check;
 - decides from the content type whether to read the body at all;
-- stops reading at a byte limit and at an overall time limit.
+- stops reading at a byte limit, counted after decompression, and at an
+  overall time limit.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import ipaddress
 import os
 import re
 import socket
+import zlib
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 from urllib.parse import urljoin, urlsplit
@@ -34,6 +37,8 @@ HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/pdf,text/plain;q=0.9,*/*;q=0.5",
     "Accept-Language": "en-US,en;q=0.8",
+    # Only encodings we decode ourselves, so the size limit covers decompressed bytes too.
+    "Accept-Encoding": "gzip, deflate",
 }
 MAX_TEXT_BYTES = 5_000_000
 MAX_PDF_BYTES = 25_000_000
@@ -43,6 +48,7 @@ READ_TIMEOUT = 15.0
 TOTAL_TIMEOUT = 25.0
 
 _TEXT_TYPES = {"application/json", "application/xml", "application/xhtml+xml", "application/rss+xml", "application/atom+xml"}
+_HOST = re.compile(r"[A-Za-z0-9.:-]+")
 _META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.IGNORECASE)
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
@@ -116,22 +122,28 @@ async def resolve_public(host: str, port: int, resolver: Resolver | None = None)
 
 async def _get_pinned(client: httpx.AsyncClient, url: str, resolver: Resolver | None):
     """Open a streaming GET to url, connected to an address we have checked."""
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise FetchError("Only http and https URLs are supported.")
-    if parts.username or parts.password:
-        raise FetchError("URLs with embedded credentials are not supported.")
-    host = parts.hostname
     try:
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-    except ValueError as exc:
-        raise FetchError("The URL has an invalid port.") from exc
-    address = await resolve_public(host, port, resolver)
-    pinned = httpx.URL(url).copy_with(host=address)
-    host_header = host if parts.port is None else f"{host}:{parts.port}"
-    request = client.build_request(
-        "GET", pinned, headers={"Host": host_header}, extensions={"sni_hostname": host}
-    )
+        parsed = httpx.URL(url)
+        host = parsed.raw_host.decode("ascii")  # IDNA-encoded for international names
+        port = parsed.port
+    except (httpx.InvalidURL, ValueError, UnicodeError) as exc:
+        raise FetchError("The URL is not valid.") from exc
+    if parsed.scheme not in ("http", "https") or not host:
+        raise FetchError("Only http and https URLs are supported.")
+    if not _HOST.fullmatch(host) or (port is not None and not 0 < port < 65536):
+        raise FetchError("The URL is not valid.")
+    if parsed.userinfo:
+        raise FetchError("URLs with embedded credentials are not supported.")
+    address = await resolve_public(host, port or (443 if parsed.scheme == "https" else 80), resolver)
+    host_header = f"[{host}]" if ":" in host else host
+    if port is not None:
+        host_header += f":{port}"
+    try:
+        request = client.build_request(
+            "GET", parsed.copy_with(host=address), headers={"Host": host_header}, extensions={"sni_hostname": host}
+        )
+    except (httpx.InvalidURL, ValueError, UnicodeError) as exc:
+        raise FetchError("The URL is not valid.") from exc
     return await client.send(request, stream=True)
 
 
@@ -149,14 +161,20 @@ async def download(
     limits = httpx.Limits(max_keepalive_connections=0)
     try:
         async with asyncio.timeout(total_timeout):
+            # trust_env off: a proxy from the environment would receive the request
+            # instead of the address we checked.
             async with httpx.AsyncClient(
-                headers=HEADERS, timeout=timeout, limits=limits, transport=transport, follow_redirects=False
+                headers=HEADERS, timeout=timeout, limits=limits, transport=transport,
+                follow_redirects=False, trust_env=False,
             ) as client:
                 for _ in range(MAX_REDIRECTS + 1):
                     response = await _get_pinned(client, url, resolver)
                     try:
                         if response.is_redirect and "location" in response.headers:
-                            url = urljoin(url, response.headers["location"])
+                            try:
+                                url = urljoin(url, response.headers["location"])
+                            except ValueError as exc:
+                                raise FetchError("The page redirected to an invalid URL.") from exc
                             continue
                         return await _read_capped(url, response)
                     finally:
@@ -179,22 +197,34 @@ async def _read_capped(url: str, response: httpx.Response) -> Download:
     kind = kind_of(content_type)
     if kind is None:
         raise FetchError(f"Unsupported content type {content_type!r}; web_express reads HTML, text and PDF.")
+    encoding = response.headers.get("content-encoding", "").strip().lower()
+    if encoding in ("", "identity"):
+        decoder = None
+    elif encoding in ("gzip", "x-gzip", "deflate"):
+        decoder = zlib.decompressobj(47)  # accepts both gzip and zlib framing
+    else:
+        raise FetchError(f"Unsupported content encoding {encoding!r}.")
     limit = MAX_PDF_BYTES if kind == "pdf" else MAX_TEXT_BYTES
-    chunks: list[bytes] = []
-    size = 0
-    truncated = False
-    async for chunk in response.aiter_bytes():
-        chunks.append(chunk)
-        size += len(chunk)
-        if size >= limit:
-            truncated = True
+    body = bytearray()
+    # Raw bytes, decompressed here with a hard output limit: a small compressed
+    # body cannot expand past the cap in memory.
+    async for raw in response.aiter_raw():
+        if decoder is None:
+            body += raw
+        else:
+            try:
+                while raw and len(body) <= limit:
+                    body += decoder.decompress(raw, limit + 1 - len(body))
+                    raw = decoder.unconsumed_tail
+            except zlib.error as exc:
+                raise FetchError("The page sent data that could not be decompressed.") from exc
+        if len(body) > limit:
             break
-    body = b"".join(chunks)[:limit]
     return Download(
         url=url,
         status=response.status_code,
         content_type=content_type,
-        body=body,
+        body=bytes(body[:limit]),
         charset=response.charset_encoding,
-        truncated=truncated,
+        truncated=len(body) > limit,
     )

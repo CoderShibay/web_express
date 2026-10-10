@@ -53,7 +53,10 @@ class _PlainExtractor(HTMLParser):
         elif tag == "a" and not self._skip_depth:
             href = dict(attrs).get("href") or ""
             if href and not href.startswith(("#", "javascript:", "mailto:")):
-                self._href = urljoin(self.base_url, href)
+                try:
+                    self._href = urljoin(self.base_url, href)
+                except ValueError:  # a malformed link: keep its text, drop the target
+                    return
                 self.parts.append("[")
 
     def handle_endtag(self, tag):
@@ -135,6 +138,15 @@ def _extract_pdf(body: bytes) -> tuple[str, str, str | None]:
 
 def extract(download: Download) -> Document:
     """Convert a Download into a Document. CPU-bound: call it in a thread."""
+    try:
+        return _extract(download)
+    except FetchError:
+        raise
+    except Exception as exc:  # parsers meet hostile input; never let one page crash a search
+        raise FetchError(f"Could not read this page ({type(exc).__name__}).") from exc
+
+
+def _extract(download: Download) -> Document:
     kind = kind_of(download.content_type)
     if kind == "pdf":
         if download.truncated:

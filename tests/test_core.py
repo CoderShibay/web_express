@@ -10,6 +10,11 @@ from web_express.passages import split_passages, top_passages
 PUBLIC = "93.184.216.34"
 
 
+def reply(body=b"", content_type="text/html", status=200, **headers):
+    """A response whose body is streamed, as real network responses are."""
+    return httpx.Response(status, headers={"content-type": content_type, **headers}, stream=httpx.ByteStream(body))
+
+
 def resolver_for(mapping):
     async def resolve(host, port):
         return mapping[host]
@@ -42,7 +47,7 @@ async def test_download_connects_to_the_checked_address_with_the_real_host():
 
     def handler(request):
         seen["host"], seen["header"] = request.url.host, request.headers["host"]
-        return httpx.Response(200, headers={"content-type": "text/html; charset=utf-8"}, content=b"<p>hi</p>")
+        return reply(b"<p>hi</p>", "text/html; charset=utf-8")
 
     result = await download(
         "http://ok.test/page", resolver=resolver_for({"ok.test": [PUBLIC]}), transport=httpx.MockTransport(handler)
@@ -78,12 +83,85 @@ async def test_download_stops_at_the_size_limit(monkeypatch):
 
 async def test_unsupported_content_type_is_refused_without_reading():
     def handler(request):
-        return httpx.Response(200, headers={"content-type": "video/mp4"}, content=b"\x00" * 10)
+        return reply(b"\x00" * 10, "video/mp4")
 
     with pytest.raises(FetchError, match="Unsupported content type"):
         await download(
             "http://ok.test/v", resolver=resolver_for({"ok.test": [PUBLIC]}), transport=httpx.MockTransport(handler)
         )
+
+
+async def fetch_ok(url="http://ok.test/", handler=None, **mapping):
+    resolve = resolver_for({"ok.test": [PUBLIC], **mapping})
+    return await download(url, resolver=resolve, transport=httpx.MockTransport(handler))
+
+
+async def test_a_response_exactly_at_the_limit_is_not_truncated(monkeypatch):
+    monkeypatch.setattr("web_express.net.MAX_TEXT_BYTES", 1000)
+    result = await fetch_ok(handler=lambda r: reply(b"x" * 1000, "text/plain"))
+    assert len(result.body) == 1000 and not result.truncated
+    result = await fetch_ok(handler=lambda r: reply(b"x" * 1001, "text/plain"))
+    assert len(result.body) == 1000 and result.truncated
+
+
+async def test_a_compressed_bomb_is_cut_off_without_expanding_in_memory(monkeypatch):
+    import gzip
+    import tracemalloc
+
+    monkeypatch.setattr("web_express.net.MAX_TEXT_BYTES", 1000)
+    bomb = gzip.compress(b"0" * 30_000_000)
+    assert len(bomb) < 40_000
+    tracemalloc.start()
+    result = await fetch_ok(handler=lambda r: reply(bomb, "text/plain", **{"content-encoding": "gzip"}))
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert len(result.body) == 1000 and result.truncated and peak < 2_000_000
+
+
+async def test_gzip_and_deflate_bodies_are_decoded():
+    import gzip
+    import zlib
+
+    for encoding, data in (("gzip", gzip.compress(b"hello")), ("deflate", zlib.compress(b"hello"))):
+        result = await fetch_ok(handler=lambda r: reply(data, "text/plain", **{"content-encoding": encoding}))
+        assert result.body == b"hello"
+    with pytest.raises(FetchError, match="content encoding"):
+        await fetch_ok(handler=lambda r: reply(b"x", "text/plain", **{"content-encoding": "br"}))
+    with pytest.raises(FetchError, match="decompressed"):
+        await fetch_ok(handler=lambda r: reply(b"not gzip", "text/plain", **{"content-encoding": "gzip"}))
+
+
+async def test_proxy_settings_from_the_environment_are_ignored(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    captured = {}
+    real = httpx.AsyncClient
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("web_express.net.httpx.AsyncClient", spy)
+    await fetch_ok(handler=lambda r: reply(b"ok", "text/plain"))
+    assert captured["trust_env"] is False
+
+
+async def test_international_and_ipv6_hosts_get_a_valid_host_header():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["host"])
+        return reply(b"ok", "text/plain")
+
+    await fetch_ok("http://éxample.test/", handler, **{"xn--xample-9ua.test": [PUBLIC]})
+    await fetch_ok("http://[2606:4700:4700::1111]:8080/a", handler, **{"2606:4700:4700::1111": ["2606:4700:4700::1111"]})
+    assert seen == ["xn--xample-9ua.test", "[2606:4700:4700::1111]:8080"]
+
+
+@pytest.mark.parametrize("url", ["http://[", "http://", "not a url", "http://ok.test:99999/"])
+async def test_malformed_urls_are_a_clean_error(url):
+    with pytest.raises(FetchError):
+        await fetch_ok(url, lambda r: reply(b"ok", "text/plain"))
 
 
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://ok.test/x", "http://user:pw@ok.test/"])
@@ -107,6 +185,11 @@ def test_page_wrapped_in_a_form_is_not_lost():
 def test_plain_fallback_keeps_links_as_absolute_urls():
     document = extract(page('<body><p>See <a href="/docs">the docs</a> now.</p></body>'))
     assert "[the docs](https://ok.test/docs)" in document.text
+
+
+def test_a_malformed_link_does_not_break_the_page():
+    document = extract(page('<body><p>Before <a href="http://[">bad link</a> after.</p></body>'))
+    assert "Before bad link after." in document.text
 
 
 def test_scripts_and_styles_are_dropped():
@@ -134,6 +217,12 @@ def test_the_matching_passage_ranks_first():
     text = filler + "\n\n" + target + "\n\n" + filler
     best = top_passages("sliding window overlap artifacts", text, 2)
     assert best and "sliding window overlap" in best[0].text
+
+
+def test_highlights_work_for_non_latin_scripts():
+    assert top_passages("東京", "前文。東京についての重要な説明です。", 3)
+    assert top_passages("привет", "Это привет миру.", 3)
+    assert top_passages("CAFÉ", "Un café noir.", 3)
 
 
 def test_no_matching_words_gives_no_highlights():

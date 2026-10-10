@@ -19,7 +19,9 @@ MAX_CHARS = 900  # split blocks larger than this
 
 _BLOCK = re.compile(r"[^\n]+(?:\n[^\n]+)*")
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-_WORD = re.compile(r"[a-z0-9]+(?:[._'+#-][a-z0-9]+)*|[a-z0-9]")
+_WORD = re.compile(r"[^\W_]+(?:[._'+#-][^\W_]+)*")
+# Chinese, Japanese and Korean are written without spaces: match them by character pairs.
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]+")
 _STOPWORDS = frozenset(
     "a an and are as at be but by can do does for from has have how i in is it its of on or "
     "that the their this to was what when where which who why will with you your".split()
@@ -34,7 +36,18 @@ class Passage:
 
 
 def tokenize(text: str) -> list[str]:
-    return _WORD.findall(text.lower())
+    tokens: list[str] = []
+    for word in _WORD.findall(text.casefold()):
+        position = 0
+        for run in _CJK.finditer(word):
+            if run.start() > position:
+                tokens.append(word[position : run.start()])
+            chars = run.group()
+            tokens.extend(chars[i : i + 2] for i in range(len(chars) - 1)) if len(chars) > 1 else tokens.append(chars)
+            position = run.end()
+        if position < len(word):
+            tokens.append(word[position:])
+    return tokens
 
 
 def split_passages(text: str) -> list[Passage]:
