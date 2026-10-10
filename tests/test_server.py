@@ -28,6 +28,7 @@ def setup(monkeypatch):
         monkeypatch.setattr(server, "_federation", Federation(sources))
         monkeypatch.setattr(server, "_search_cache", server.TTLCache(16, 60))
         monkeypatch.setattr(server, "_document_cache", server.TTLCache(16, 60))
+        monkeypatch.setattr(server, "_partial_cache", server.TTLCache(16, 60))
         loads = []
 
         async def fake_download(url, **kwargs):
@@ -126,3 +127,39 @@ async def test_bad_arguments_are_rejected(setup):
     for kwargs in ({"query": " "}, {"query": "q", "freshness": "decade"}, {"query": "q", "category": "recipes"}):
         with pytest.raises(ValueError):
             await server.search(**kwargs)
+
+
+async def test_filters_normalise_hosts_and_reject_non_domains(setup):
+    hits = [Hit("Dot", "https://sub.example.org./x", source="web1"), Hit("Port", "https://example.org:8443/x", source="web1"),
+            Hit("Other", "https://other.test/x", source="web1")]
+    setup([Fake("web1", ("web",), hits)])
+    out = await server.search("q", contents=False, exclude_domains=["example.org:443"])
+    assert [r["title"] for r in out["results"]] == ["Other"]
+    out = await server.search("q", contents=False, include_domains=["EXAMPLE.org."])
+    assert [r["title"] for r in out["results"]] == ["Dot", "Port"]
+    with pytest.raises(ValueError, match="not a domain"):
+        await server.search("q", exclude_domains=["   "])
+
+
+async def test_a_redirect_outside_the_filters_returns_no_content(setup):
+    hit = Hit("Go", "https://allowed.test/go", source="web1")
+    setup([Fake("web1", ("web",), [hit])], {"https://allowed.test/go": doc("https://blocked.test/secret", "secret pizza text")})
+    out = await server.search("pizza", exclude_domains=["blocked.test"])
+    result = out["results"][0]
+    assert result["final_url"] == "https://blocked.test/secret" and "highlights" not in result
+    assert "outside the domain filters" in result["content_error"]
+
+
+async def test_partial_answers_are_retried_sooner_than_complete_ones(setup, monkeypatch):
+    from web_express.sources import SourceError
+
+    good = Fake("web1", ("web",), [Hit("A", "https://w.test/a", source="web1")])
+    flaky = Fake("web2", ("web",), SourceError("web2: down."))
+    setup([good, flaky])
+    await server.search("q", contents=False)
+    assert len(server._partial_cache) == 1 and len(server._search_cache) == 0
+    flaky.hits = [Hit("B", "https://w.test/b", source="web2")]
+    server._federation._paused.clear()
+    monkeypatch.setattr(server, "_partial_cache", server.TTLCache(16, 60))  # as if the short time limit passed
+    out = await server.search("q", contents=False)
+    assert out["sources_used"] == ["web1", "web2"] and len(server._search_cache) == 1

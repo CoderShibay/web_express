@@ -3,9 +3,9 @@ from datetime import date
 import httpx
 import pytest
 
-from web_express.federation import Federation, canonical_url, fuse, guess_categories
+from web_express.federation import Federation, canonical_url, fuse, guess_categories, valid_hit
 from web_express.sources import (
-    Arxiv, EuropePMC, GitHub, HackerNews, Hit, OpenAlex, Source, SourceError, StackOverflow, Wikipedia,
+    Arxiv, EuropePMC, Gdelt, GitHub, HackerNews, Hit, OpenAlex, Source, SourceError, StackOverflow, Wikipedia, _literal,
 )
 
 ARXIV = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry>
@@ -185,3 +185,100 @@ async def test_federation_auto_adds_specialists_only_when_hinted():
     federation = Federation([web, papers])
     assert (await federation.search("best pizza in naples")).used == ["web1"]
     assert (await federation.search("tumor segmentation study")).used == ["web1", "p1"]
+
+
+# --- hostile or broken answers ------------------------------------------------
+
+BROKEN = [{"resultList": []}, {"results": None}, {"items": None}, {"hits": None}, {"articles": "x"}, {}]
+
+
+@pytest.mark.parametrize("source", [EuropePMC, OpenAlex, GitHub, StackOverflow, HackerNews, Gdelt])
+async def test_wrongly_shaped_answers_are_a_source_error_or_empty_never_a_crash(source):
+    for payload in BROKEN:
+        try:
+            hits = await ask(source(), lambda r: httpx.Response(200, json=payload))
+        except SourceError:
+            continue
+        assert hits == []
+
+
+async def test_malformed_rows_are_skipped_and_good_rows_kept():
+    payload = {"resultList": {"result": [None, {"id": 5, "source": "MED"}, {"id": "9", "source": "MED", "title": None, "doi": 123},
+                                         {"id": "7", "source": "MED", "title": "Good", "abstractText": None}]}}
+    hits = await ask(EuropePMC(), lambda r: httpx.Response(200, json=payload))
+    assert [h.url for h in hits] == ["https://europepmc.org/article/MED/9", "https://europepmc.org/article/MED/7"]
+    assert "doi" not in hits[0].extra
+    payload = {"articles": [None, {"url": "https://n.test/a", "title": "T", "seendate": 20260101}]}
+    hits = await ask(Gdelt(), lambda r: httpx.Response(200, json=payload))
+    assert len(hits) == 1 and hits[0].published is None
+
+
+def test_bad_hits_cannot_crash_merging():
+    assert canonical_url("https://example.com:notaport/x") == "https://example.com:notaport/x"
+    assert not valid_hit(Hit("T", "https://example.com:notaport/x", source="s"))
+    assert not valid_hit(Hit("T", "javascript:alert(1)", source="s"))
+    assert not valid_hit(Hit(None, "https://ok.test/", source="s"))
+    odd = Hit("T", "https://ok.test/", source="s", extra={"doi": 123})
+    assert valid_hit(odd) and "doi" not in odd.extra and len(fuse([[odd]])) == 1
+
+
+async def test_one_source_returning_rubbish_does_not_sink_the_others():
+    good = Fake("p1", ("papers",), [Hit("P", "https://p.test/", source="p1")])
+    rubbish = Fake("p2", ("papers",), [Hit("X", "https://example.com:notaport/x", source="p2"), "not a hit", None])
+    wrong = Fake("p3", ("papers",), {"not": "a list"})
+    outcome = await Federation([good, rubbish, wrong]).search("q", category="papers")
+    assert [h.title for h in outcome.hits] == ["P"] and outcome.used == ["p1", "p2"]
+    assert "unexpected answer" in outcome.errors["p3"]
+
+
+def test_user_words_cannot_rewrite_a_source_query():
+    assert _literal("cancer) OR FIRST_PDATE:[1900-01-01 TO 2100-01-01] OR (cancer") == \
+        "cancer or FIRST_PDATE 1900-01-01 TO 2100-01-01 or cancer"
+    assert _literal('climate OR sourcelang:spanish') == "climate or sourcelang spanish"
+    assert _literal('"exact phrase" NOT this') == '"exact phrase" not this'
+    assert _literal('unbalanced "quote') == "unbalanced quote"
+
+
+async def test_mandatory_filters_survive_injection_attempts():
+    seen = {}
+
+    def handler(request):
+        seen["q"] = request.url.params.get("query") or request.url.params.get("q")
+        return httpx.Response(200, json={"resultList": {"result": []}, "items": [], "articles": []})
+
+    await ask(EuropePMC(), handler, "cancer) OR FIRST_PDATE:[1900-01-01 TO 2100-01-01] OR (cancer", since=date(2026, 1, 1))
+    assert seen["q"].startswith("(cancer or FIRST_PDATE 1900-01-01 TO 2100-01-01 or cancer) AND FIRST_PDATE:[2026-01-01 TO ")
+    await ask(GitHub(), handler, "search stars:>100000 user:torvalds", since=date(2026, 1, 1))
+    assert seen["q"] == "search stars >100000 user torvalds pushed:>2026-01-01"
+    await ask(Gdelt(), handler, "climate OR sourcelang:spanish")
+    assert seen["q"] == "climate or sourcelang spanish sourcelang:english"
+
+
+# --- rate limits and deadlines ------------------------------------------------
+
+async def test_waiting_for_our_own_rate_limit_is_not_a_source_failure():
+    class Slowed(GitHub):
+        min_interval = 0.2
+        timeout = 0.05
+
+    source = Slowed()
+    federation = Federation([source], transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"items": []})))
+    import asyncio
+
+    first, second = await asyncio.gather(federation.search("one", "code"), federation.search("two", "code"))
+    assert first.errors == {} and second.errors == {} and not federation._paused
+
+
+async def test_a_slow_request_is_a_source_failure():
+    import asyncio
+
+    class Slowed(GitHub):
+        timeout = 0.05
+
+    async def handler(request):
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, json={"items": []})
+
+    federation = Federation([Slowed()], transport=httpx.MockTransport(handler))
+    outcome = await federation.search("q", "code")
+    assert "took too long" in outcome.errors["github"] and "github" in federation._paused

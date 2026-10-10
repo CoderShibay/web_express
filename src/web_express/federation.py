@@ -15,6 +15,7 @@ from .net import USER_AGENT
 from .sources import CATEGORIES, DuckDuckGo, Hit, Source, SourceError, default_sources
 
 FRESHNESS_DAYS = {"day": 1, "week": 7, "month": 31, "year": 366}
+QUEUE_LIMIT = 25.0  # longest a search waits for one source, including its rate-limit queue
 RRF_K = 60
 _TRACKING = re.compile(r"^(utm_\w+|fbclid|gclid|mc_[ce]id|ref|ref_src|igshid)$", re.IGNORECASE)
 
@@ -46,15 +47,41 @@ def guess_categories(query: str, freshness: str = "") -> list[str]:
 
 
 def canonical_url(url: str) -> str:
-    """A form of the URL that is the same for trivially different links to one page."""
-    parts = urlsplit(url.strip())
-    host = (parts.hostname or "").lower().removeprefix("www.")
-    path = parts.path.rstrip("/")
-    if host == "arxiv.org":
-        path = re.sub(r"v\d+$", "", re.sub(r"^/(pdf|html)/", "/abs/", path).removesuffix(".pdf"))
-    query = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not _TRACKING.match(k)])
-    port = f":{parts.port}" if parts.port and parts.port not in (80, 443) else ""
-    return urlunsplit(("https", host + port, path, query, ""))
+    """A form of the URL that is the same for trivially different links to one page.
+
+    Never raises: a URL that cannot be parsed is returned unchanged.
+    """
+    try:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower().rstrip(".").removeprefix("www.")
+        path = parts.path.rstrip("/")
+        if host == "arxiv.org":
+            path = re.sub(r"v\d+$", "", re.sub(r"^/(pdf|html)/", "/abs/", path).removesuffix(".pdf"))
+        query = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not _TRACKING.match(k)])
+        port = f":{parts.port}" if parts.port and parts.port not in (80, 443) else ""
+        return urlunsplit(("https", host + port, path, query, ""))
+    except ValueError:
+        return url.strip()
+
+
+def valid_hit(hit) -> bool:
+    """Whether a source's row is safe to rank and return: right types, a real http(s) link."""
+    if not isinstance(hit, Hit) or not all(isinstance(v, str) for v in (hit.title, hit.url, hit.snippet, hit.source)):
+        return False
+    if not isinstance(hit.extra, dict) or not isinstance(hit.published, (str, type(None))):
+        return False
+    if not isinstance(hit.content, (str, type(None))):
+        return False
+    try:
+        parts = urlsplit(hit.url)
+        _ = parts.port
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
+    if "doi" in hit.extra and not isinstance(hit.extra["doi"], str):
+        del hit.extra["doi"]
+    return True
 
 
 def _identity(hit: Hit) -> str:
@@ -112,9 +139,14 @@ class Federation:
         per_source = max(limit, 8)
 
         async def run(source: Source) -> list[Hit]:
-            return await asyncio.wait_for(
-                self._ask(source, client, query, per_source, since, freshness, region, web_suffix), source.timeout
+            # Each source times its own requests. This outer limit only stops a search
+            # from queueing behind a source's rate limit for ever.
+            answer = await asyncio.wait_for(
+                self._ask(source, client, query, per_source, since, freshness, region, web_suffix), QUEUE_LIMIT
             )
+            if not isinstance(answer, list):
+                raise SourceError(f"{source.name}: sent an unexpected answer.")
+            return [hit for hit in answer if valid_hit(hit)]
 
         async with httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -126,8 +158,9 @@ class Federation:
         for source, answer in zip(active, answers):
             if isinstance(answer, SourceError):
                 errors[source.name] = str(answer)
-            elif isinstance(answer, TimeoutError):
-                errors[source.name] = f"{source.name}: took too long to answer."
+            elif isinstance(answer, TimeoutError):  # our own queue, not the source: do not pause it
+                errors[source.name] = f"{source.name}: busy, skipped this time."
+                continue
             elif isinstance(answer, BaseException):
                 errors[source.name] = f"{source.name}: failed ({type(answer).__name__})."
             else:

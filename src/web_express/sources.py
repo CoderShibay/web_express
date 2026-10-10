@@ -64,6 +64,28 @@ def _iso_date(value) -> str | None:
     return match.group(0) if match else None
 
 
+def _text(value) -> str:
+    """A string from a field that should be one; anything else becomes empty."""
+    return value if isinstance(value, str) else ""
+
+
+def _dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _literal(query: str, drop: str = '()[]{}:') -> str:
+    """The query as plain words: no field qualifiers, grouping or boolean operators.
+
+    Sources have their own query languages. Mandatory filters (dates, language)
+    are appended to the user's words, so those words must not be able to rewrite them.
+    """
+    cleaned = query.translate({ord(c): " " for c in drop})
+    if cleaned.count('"') % 2:
+        cleaned = cleaned.replace('"', " ")
+    words = [w.lower() if w in ("AND", "OR", "NOT") else w for w in cleaned.split()]
+    return " ".join(words)
+
+
 def _clip(text: str, limit: int = 300) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
@@ -73,7 +95,7 @@ class Source:
     name = ""
     categories: tuple[str, ...] = ()
     min_interval = 0.0  # seconds between requests to this source
-    timeout = 8.0
+    timeout = 8.0  # for one request, not counting the wait for our own rate limit
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -81,6 +103,24 @@ class Source:
 
     def available(self) -> bool:
         return True
+
+    def _rows(self, value) -> list[dict]:
+        """The list of result rows from an API answer; a different shape is a source error."""
+        if not isinstance(value, list):
+            raise SourceError(f"{self.name}: sent an unexpected answer.")
+        return [row for row in value if isinstance(row, dict)]
+
+    def _collect(self, rows: list[dict], build) -> list[Hit]:
+        """Build a Hit from each row, skipping rows whose fields are not what the API promises."""
+        hits = []
+        for row in rows:
+            try:
+                hit = build(row)
+            except (TypeError, AttributeError, KeyError, ValueError, IndexError):
+                continue
+            if hit is not None:
+                hits.append(hit)
+        return hits
 
     async def search(self, client: httpx.AsyncClient, query: str, limit: int, since: date | None) -> list[Hit]:
         raise NotImplementedError
@@ -90,8 +130,10 @@ class Source:
             wait = self.min_interval - (time.monotonic() - self._last)
             if wait > 0:
                 await asyncio.sleep(wait)
-            try:
-                response = await client.get(url, params=params, headers=headers)
+            try:  # the deadline covers the request only, not the wait for our own rate limit
+                response = await asyncio.wait_for(client.get(url, params=params, headers=headers), self.timeout)
+            except TimeoutError as exc:
+                raise SourceError(f"{self.name}: took too long to answer.") from exc
             except httpx.HTTPError as exc:
                 raise SourceError(f"{self.name}: could not connect ({type(exc).__name__}).") from exc
             finally:
@@ -146,12 +188,15 @@ class Wikipedia(Source):
             "action": "query", "generator": "search", "gsrsearch": query, "gsrlimit": min(limit, 5),
             "prop": "extracts|info", "exintro": 1, "explaintext": 1, "exlimit": "max", "inprop": "url", "format": "json",
         })
-        pages = sorted((data.get("query") or {}).get("pages", {}).values(), key=lambda p: p.get("index", 0))
-        return [
-            Hit(p.get("title", ""), p["fullurl"], _clip(p.get("extract", "")), self.name,
-                _iso_date(p.get("touched")), p.get("extract") or None)
-            for p in pages if p.get("fullurl")
-        ]
+        pages = self._rows(list(_dict(_dict(data.get("query")).get("pages")).values()))
+        pages.sort(key=lambda p: p.get("index") if isinstance(p.get("index"), int) else 0)
+
+        def build(p):
+            extract = _text(p.get("extract"))
+            return Hit(_text(p.get("title")), p["fullurl"], _clip(extract), self.name, _iso_date(p.get("touched")),
+                       extract or None)
+
+        return self._collect(pages, build)
 
 
 # --- papers ------------------------------------------------------------------
@@ -166,7 +211,7 @@ class Arxiv(Source):
     timeout = 12.0
 
     async def search(self, client, query, limit, since):
-        terms = re.sub(r'[":()\[\]]', " ", query).split()
+        terms = _literal(query, drop='()[]{}:"').split()
         if not terms:
             return []
         response = await self._get(client, "https://export.arxiv.org/api/query", {
@@ -199,24 +244,29 @@ class EuropePMC(Source):
     min_interval = 0.2
 
     async def search(self, client, query, limit, since):
+        query = _literal(query)
+        if not query:
+            return []
         if since:
             query = f"({query}) AND FIRST_PDATE:[{since.isoformat()} TO {date.today().isoformat()}]"
         data = await self._json(client, "https://www.ebi.ac.uk/europepmc/webservices/rest/search", {
             "query": query, "format": "json", "pageSize": limit, "resultType": "core",
         })
-        hits = []
-        for r in (data.get("resultList") or {}).get("result", []):
-            if not r.get("id") or not r.get("source"):
-                continue
-            abstract = _html_to_text(r.get("abstractText", ""))
-            extra = {"authors": r.get("authorString", ""), "open_access": r.get("isOpenAccess") == "Y"}
-            if r.get("doi"):
+
+        def build(r):
+            source, number = _text(r.get("source")), _text(r.get("id"))
+            if not re.fullmatch(r"[A-Za-z]+", source) or not re.fullmatch(r"[\w.-]+", number):
+                return None
+            abstract = _html_to_text(_text(r.get("abstractText")))
+            extra = {"authors": _text(r.get("authorString")), "open_access": r.get("isOpenAccess") == "Y"}
+            if _text(r.get("doi")):
                 extra["doi"] = r["doi"]
-            hits.append(Hit(
-                unescape(r.get("title", "")).rstrip("."), f"https://europepmc.org/article/{r['source']}/{r['id']}",
+            return Hit(
+                unescape(_text(r.get("title"))).rstrip("."), f"https://europepmc.org/article/{source}/{number}",
                 _clip(abstract), self.name, _iso_date(r.get("firstPublicationDate")), abstract or None, extra,
-            ))
-        return hits
+            )
+
+        return self._collect(self._rows(_dict(data.get("resultList")).get("result", [])), build)
 
 
 class OpenAlex(Source):
@@ -233,24 +283,26 @@ class OpenAlex(Source):
         if "@" in _env("WEB_EXPRESS_CONTACT"):
             params["mailto"] = _env("WEB_EXPRESS_CONTACT")
         data = await self._json(client, "https://api.openalex.org/works", params)
-        hits = []
-        for work in data.get("results", []):
-            location = work.get("primary_location") or {}
-            oa_url = (work.get("open_access") or {}).get("oa_url")
-            url = oa_url or location.get("landing_page_url") or work.get("doi") or work.get("id")
-            if not url or not work.get("title"):
-                continue
+
+        def build(work):
+            title = _text(work.get("title"))
+            doi = _text(work.get("doi"))
+            url = (_text(_dict(work.get("open_access")).get("oa_url"))
+                   or _text(_dict(work.get("primary_location")).get("landing_page_url")) or doi or _text(work.get("id")))
+            if not url or not title:
+                return None
             words: dict[int, str] = {}
-            for word, positions in (work.get("abstract_inverted_index") or {}).items():
+            for word, positions in _dict(work.get("abstract_inverted_index")).items():
                 for position in positions:
-                    words[position] = word
+                    if isinstance(position, int):
+                        words[position] = word
             abstract = " ".join(words[i] for i in sorted(words))
-            extra = {"cited_by": work.get("cited_by_count", 0)}
-            if work.get("doi"):
-                extra["doi"] = work["doi"].removeprefix("https://doi.org/")
-            hits.append(Hit(work["title"], url, _clip(abstract), self.name, _iso_date(work.get("publication_date")),
-                            abstract or None, extra))
-        return hits
+            extra: dict = {"cited_by": work.get("cited_by_count") if isinstance(work.get("cited_by_count"), int) else 0}
+            if doi:
+                extra["doi"] = doi.removeprefix("https://doi.org/")
+            return Hit(title, url, _clip(abstract), self.name, _iso_date(work.get("publication_date")), abstract or None, extra)
+
+        return self._collect(self._rows(data.get("results")), build)
 
 
 # --- code --------------------------------------------------------------------
@@ -264,19 +316,25 @@ class GitHub(Source):
         headers = {"Accept": "application/vnd.github+json"}
         if _env("WEB_EXPRESS_GITHUB_TOKEN"):
             headers["Authorization"] = f"Bearer {_env('WEB_EXPRESS_GITHUB_TOKEN')}"
+        query = _literal(query)
+        if not query:
+            return []
         pushed = f" pushed:>{since.isoformat()}" if since else ""
         data = await self._json(client, "https://api.github.com/search/repositories",
                                 {"q": query + pushed, "per_page": limit}, headers)
-        hits = []
-        for repo in data.get("items", []):
-            description = repo.get("description") or ""
-            hits.append(Hit(
-                repo.get("full_name", ""), repo.get("html_url", ""), _clip(description), self.name,
+
+        def build(repo):
+            if not _text(repo.get("html_url")) or not _text(repo.get("full_name")):
+                return None
+            return Hit(
+                repo["full_name"], repo["html_url"], _clip(_text(repo.get("description"))), self.name,
                 _iso_date(repo.get("pushed_at")), None,
-                {"stars": repo.get("stargazers_count", 0), "language": repo.get("language"),
-                 "license": (repo.get("license") or {}).get("spdx_id")},
-            ))
-        return [h for h in hits if h.url]
+                {"stars": repo.get("stargazers_count") if isinstance(repo.get("stargazers_count"), int) else 0,
+                 "language": _text(repo.get("language")) or None,
+                 "license": _text(_dict(repo.get("license")).get("spdx_id")) or None},
+            )
+
+        return self._collect(self._rows(data.get("items")), build)
 
 
 class StackOverflow(Source):
@@ -293,7 +351,8 @@ class StackOverflow(Source):
         if since:
             params["fromdate"] = int(datetime(since.year, since.month, since.day, tzinfo=timezone.utc).timestamp())
         data = await self._json(client, f"{self.api}/search/advanced", params)
-        questions = [q for q in data.get("items", []) if q.get("question_id") and q.get("link")]
+        questions = [q for q in self._rows(data.get("items"))
+                     if isinstance(q.get("question_id"), int) and _text(q.get("link"))]
         answers: dict[int, dict] = {}
         answered = [str(q["question_id"]) for q in questions if q.get("is_answered")]
         if answered and not data.get("backoff"):
@@ -301,23 +360,27 @@ class StackOverflow(Source):
                 found = await self._json(client, f"{self.api}/questions/{';'.join(answered)}/answers", {
                     "site": "stackoverflow", "order": "desc", "sort": "votes", "filter": "withbody", "pagesize": 30,
                 })
+                rows = self._rows(found.get("items"))
             except SourceError:
-                found = {}
-            for answer in found.get("items", []):  # sorted by votes: keep the first per question
+                rows = []
+            for answer in rows:  # sorted by votes: keep the first per question
                 answers.setdefault(answer.get("question_id"), answer)
-        hits = []
-        for q in questions:
-            question = _html_to_text(q.get("body", ""))
+
+        def build(q):
+            question = _html_to_text(_text(q.get("body")))
             content = "## Question\n\n" + question
             answer = answers.get(q["question_id"])
             if answer:
                 label = "Accepted answer" if answer.get("is_accepted") else "Top answer"
-                content += f"\n\n## {label} (score {answer.get('score', 0)})\n\n" + _html_to_text(answer.get("body", ""))
-            hits.append(Hit(
-                unescape(q.get("title", "")), q["link"], _clip(question), self.name, _iso_date(q.get("creation_date")),
-                content, {"score": q.get("score", 0), "answered": bool(q.get("is_answered"))},
-            ))
-        return hits
+                score = answer.get("score") if isinstance(answer.get("score"), int) else 0
+                content += f"\n\n## {label} (score {score})\n\n" + _html_to_text(_text(answer.get("body")))
+            return Hit(
+                unescape(_text(q.get("title"))), q["link"], _clip(question), self.name, _iso_date(q.get("creation_date")),
+                content, {"score": q.get("score") if isinstance(q.get("score"), int) else 0,
+                          "answered": bool(q.get("is_answered"))},
+            )
+
+        return self._collect(questions, build)
 
 
 # --- news and discussion -----------------------------------------------------
@@ -332,16 +395,20 @@ class HackerNews(Source):
             stamp = int(datetime(since.year, since.month, since.day, tzinfo=timezone.utc).timestamp())
             params["numericFilters"] = f"created_at_i>{stamp}"
         data = await self._json(client, "https://hn.algolia.com/api/v1/search", params)
-        hits = []
-        for story in data.get("hits", []):
-            discussion = f"https://news.ycombinator.com/item?id={story.get('objectID')}"
-            text = _html_to_text(story.get("story_text") or "")
-            hits.append(Hit(
-                story.get("title") or "", story.get("url") or discussion, _clip(text), self.name,
-                _iso_date(story.get("created_at")), text or None,
-                {"points": story.get("points", 0), "discussion": discussion},
-            ))
-        return [h for h in hits if h.title]
+
+        def build(story):
+            title = _text(story.get("title"))
+            if not title:
+                return None
+            discussion = f"https://news.ycombinator.com/item?id={story['objectID']}"
+            text = _html_to_text(_text(story.get("story_text")))
+            return Hit(
+                title, _text(story.get("url")) or discussion, _clip(text), self.name, _iso_date(story.get("created_at")),
+                text or None,
+                {"points": story.get("points") if isinstance(story.get("points"), int) else 0, "discussion": discussion},
+            )
+
+        return self._collect(self._rows(data.get("hits")), build)
 
 
 class Gdelt(Source):
@@ -353,24 +420,28 @@ class Gdelt(Source):
     timeout = 6.0  # it is often slow; do not let it hold up the other sources
 
     async def search(self, client, query, limit, since):
+        query = _literal(query)
+        if not query:
+            return []
         days = max(1, (date.today() - since).days) if since else 30
         response = await self._get(client, "https://api.gdeltproject.org/api/v2/doc/doc", {
             "query": f"{query} sourcelang:english", "mode": "artlist", "format": "json", "maxrecords": limit,
-            "sort": "hybridrel",
-            "timespan": f"{days}d",
+            "sort": "hybridrel", "timespan": f"{days}d",
         })
         try:
             data = response.json()
         except ValueError as exc:  # GDELT explains bad queries in plain text
             raise SourceError(f"gdelt: {_clip(response.text, 120)}") from exc
-        hits = []
-        for article in data.get("articles", []) if isinstance(data, dict) else []:
-            seen = article.get("seendate", "")
+
+        def build(article):
+            if not _text(article.get("url")) or not _text(article.get("title")):
+                return None
+            seen = _text(article.get("seendate"))
             published = f"{seen[:4]}-{seen[4:6]}-{seen[6:8]}" if len(seen) >= 8 and seen[:8].isdigit() else None
-            if article.get("url") and article.get("title"):
-                hits.append(Hit(article["title"], article["url"], "", self.name, published, None,
-                                {"domain": article.get("domain"), "language": article.get("language")}))
-        return hits
+            return Hit(article["title"], article["url"], "", self.name, published, None,
+                       {"domain": _text(article.get("domain")) or None, "language": _text(article.get("language")) or None})
+
+        return self._collect(self._rows(_dict(data).get("articles", [])), build)
 
 
 def default_sources() -> list[Source]:

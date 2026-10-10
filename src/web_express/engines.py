@@ -95,6 +95,7 @@ class DuckDuckGo:
     name = "duckduckgo"
     url = "https://html.duckduckgo.com/html/"
     min_interval = 1.5  # seconds between searches; DuckDuckGo blocks bursts
+    timeout = 12.0  # for the request itself, not the wait for our own rate limit
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -111,8 +112,10 @@ class DuckDuckGo:
             if wait > 0:
                 await asyncio.sleep(wait)
             try:
-                async with httpx.AsyncClient(headers=HEADERS, timeout=20) as client:
-                    response = await client.post(self.url, data=form)
+                async with httpx.AsyncClient(headers=HEADERS, timeout=self.timeout) as client:
+                    response = await asyncio.wait_for(client.post(self.url, data=form), self.timeout)
+            except TimeoutError as exc:
+                raise EngineError("DuckDuckGo took too long to answer.") from exc
             except httpx.HTTPError as exc:
                 raise EngineError(f"Could not reach DuckDuckGo ({type(exc).__name__}).") from exc
             finally:

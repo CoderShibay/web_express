@@ -35,6 +35,7 @@ server = FastMCP(
 
 _federation = Federation()
 _search_cache = TTLCache(max_entries=256, ttl=600)
+_partial_cache = TTLCache(max_entries=64, ttl=45)  # answers with a failed source: retry it soon
 _document_cache = TTLCache(max_entries=64, ttl=900)
 _loading: dict = {}
 _searching: dict = {}
@@ -71,24 +72,32 @@ async def _load(url: str, timeout: float = FETCH_TIMEOUT) -> Document:
     return await _shared(_loading, key, work)
 
 
-def _host_matches(url: str, domains: list[str]) -> bool:
+def _host(value: str) -> str:
+    """The bare host of a URL or domain: lower case, IDNA, no port, no trailing dot. Empty if invalid."""
+    value = value.strip()
     try:
-        host = (urlsplit(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return any(host == d or host.endswith("." + d) for d in domains)
+        host = urlsplit(value if "//" in value else "//" + value).hostname or ""
+        return host.rstrip(".").encode("idna").decode("ascii").lower() if host else ""
+    except (ValueError, UnicodeError):
+        return ""
 
 
-def _clean_domains(domains: list[str] | None) -> list[str]:
+def _host_matches(url: str, domains: list[str]) -> bool:
+    host = _host(url)
+    return bool(host) and any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _allowed(url: str, include: list[str], exclude: list[str]) -> bool:
+    return (not include or _host_matches(url, include)) and not _host_matches(url, exclude)
+
+
+def _clean_domains(domains: list[str] | None, name: str) -> list[str]:
     cleaned = []
     for domain in domains or []:
-        domain = domain.strip().lower()
-        try:
-            domain = (urlsplit(domain).hostname or "") if "//" in domain else domain.split("/")[0]
-        except ValueError:
-            continue
-        if domain:
-            cleaned.append(domain.removeprefix("www."))
+        host = _host(domain)
+        if not host:
+            raise ValueError(f"{name} has an entry that is not a domain: {domain!r}.")
+        cleaned.append(host.removeprefix("www."))
     return cleaned
 
 
@@ -102,7 +111,7 @@ def _from_source(query: str, text: str, limit: int) -> list[dict]:
     return [{"text": p.text} for p in best]
 
 
-async def _result(query: str, hit: Hit, contents: bool, highlights: int) -> dict:
+async def _result(query: str, hit: Hit, contents: bool, highlights: int, include: list[str], exclude: list[str]) -> dict:
     result: dict = {"title": hit.title, "url": hit.url, "snippet": hit.snippet}
     if hit.published:
         result["published"] = hit.published
@@ -119,6 +128,11 @@ async def _result(query: str, hit: Hit, contents: bool, highlights: int) -> dict
             result["total_chars"] = len(hit.content)
             return result
         document = await _load(hit.url, timeout=PAGE_TIMEOUT)
+        if document.url != hit.url:
+            result["final_url"] = document.url
+            if not _allowed(document.url, include, exclude):
+                result["content_error"] = "The page redirected to a site outside the domain filters."
+                return result
         result["title"] = hit.title or document.title
         if document.published and "published" not in result:
             result["published"] = document.published
@@ -175,8 +189,8 @@ async def search(
         raise ValueError(f"category must be one of: auto, {', '.join(CATEGORIES)}.")
     max_results = max(1, min(max_results, 10))
     highlights_per_result = max(1, min(highlights_per_result, 6))
-    include = _clean_domains(include_domains)
-    exclude = _clean_domains(exclude_domains)
+    include = _clean_domains(include_domains, "include_domains")
+    exclude = _clean_domains(exclude_domains, "exclude_domains")
 
     web_suffix = ""
     if include:
@@ -184,22 +198,21 @@ async def search(
     web_suffix += "".join(f" -site:{d}" for d in exclude)
 
     key = (query, category, freshness, region, web_suffix)
-    outcome: Outcome | None = _search_cache.get(key)
+    outcome: Outcome | None = _search_cache.get(key) or _partial_cache.get(key)
     cached = outcome is not None
     if outcome is None:
         outcome = await _shared(
             _searching, key, lambda: _federation.search(query, category, 30, freshness, region, web_suffix)
         )
         if outcome.hits:  # an empty answer may be a soft block; do not remember it
-            _search_cache.set(key, outcome)
+            (_partial_cache if outcome.errors else _search_cache).set(key, outcome)
     if not outcome.used and outcome.errors:
         raise RuntimeError("No search source answered: " + " ".join(outcome.errors.values()))
 
-    hits = [
-        h for h in outcome.hits
-        if (not include or _host_matches(h.url, include)) and not _host_matches(h.url, exclude)
-    ][:max_results]
-    results = list(await asyncio.gather(*(_result(query, h, contents, highlights_per_result) for h in hits)))
+    hits = [h for h in outcome.hits if _allowed(h.url, include, exclude)][:max_results]
+    results = list(await asyncio.gather(
+        *(_result(query, h, contents, highlights_per_result, include, exclude) for h in hits)
+    ))
     response = {
         "query": query,
         "categories": outcome.categories,
