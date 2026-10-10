@@ -6,7 +6,8 @@ import asyncio
 import dataclasses
 import logging
 import os
-import time
+import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit
@@ -20,7 +21,7 @@ from . import embed
 from .cache import TTLCache
 from .extract import Document, extract
 from .federation import FRESHNESS_DAYS, Federation, Outcome, fuse
-from .index import LocalIndex
+from .index import LocalIndex, worth_keeping
 from .index import enabled as index_enabled
 from .net import TOTAL_TIMEOUT, FetchError, download
 from .passages import split_passages
@@ -32,7 +33,6 @@ log = logging.getLogger("web_express")
 PAGE_TIMEOUT = 12.0  # per page, when search reads pages on the caller's behalf
 RERANK_POOL = 30  # merged results considered before the best max_results are kept
 LOCAL_RESULTS = 8  # pages the local index may add to a search
-MIN_INDEX_CHARS = 200  # shorter pages are usually error or login screens; not worth keeping
 FETCH_TIMEOUT = TOTAL_TIMEOUT + 10.0  # download plus extraction, for an explicit fetch
 
 server = FastMCP(
@@ -56,6 +56,7 @@ _searching: dict = {}
 _background: set = set()
 _index: LocalIndex | None = None
 _index_failed = False
+_index_lock = threading.Lock()
 
 
 def _max_age() -> float:
@@ -68,23 +69,47 @@ def _max_age() -> float:
 
 def _get_index() -> LocalIndex | None:
     global _index, _index_failed
-    if _index is None and not _index_failed and index_enabled():
-        try:
-            _index = LocalIndex()
-        except Exception as exc:  # read-only disk, SQLite without full-text search: carry on without it
-            _index_failed = True
-            log.warning("the local index is unavailable: %s", exc)
+    if _index is not None or _index_failed or not index_enabled():
+        return _index
+    with _index_lock:  # worker threads may ask at the same moment: open it once
+        if _index is None and not _index_failed:
+            try:
+                _index = LocalIndex()
+            except Exception as exc:  # read-only disk, SQLite without full-text search: carry on without it
+                _index_failed = True
+                log.warning("the local index is unavailable: %s", exc)
     return _index
 
 
+def _index_failure(exc: Exception) -> None:
+    """A database error while reading or writing: stop using the index for this run, keep serving."""
+    global _index, _index_failed
+    log.warning("the local index failed and is switched off until restart: %s", exc)
+    with _index_lock:
+        _index_failed = True
+        _index = None
+
+
+def _stored(url: str, max_age: float | None):
+    """The index's copy of url, or None; a failing index counts as having no copy."""
+    index = _get_index()
+    if index is None:
+        return None
+    try:
+        return index.get(url, max_age)
+    except sqlite3.Error as exc:
+        _index_failure(exc)
+        return None
+
+
 def _model_id(embedder) -> str:
-    return f"{embedder.spec.name}@{embedder.spec.revision[:8]}"
+    return f"{embedder.spec.name}@{embedder.spec.revision}"
 
 
 def _remember(document: Document) -> None:
     """Store a page in the local index, with a vector for search by meaning when the model is ready."""
     index = _get_index()
-    if index is None or len(document.text) < MIN_INDEX_CHARS:
+    if index is None or document.truncated or not worth_keeping(document):
         return
     try:
         vector, model = None, None
@@ -97,6 +122,8 @@ def _remember(document: Document) -> None:
             norm = float((vector @ vector) ** 0.5)
             vector, model = (vector / norm, _model_id(embedder)) if norm > 0 else (None, None)
         index.add(document, vector, model)
+    except sqlite3.Error as exc:
+        _index_failure(exc)
     except Exception as exc:
         log.warning("could not store a page in the local index: %s", exc)
 
@@ -127,20 +154,19 @@ async def _load(url: str, timeout: float = FETCH_TIMEOUT, refresh: bool = False)
     """Download and extract a page, reusing a recent copy when there is one.
 
     Looks in memory, then in the local index, then on the network. If the
-    network fails and the index holds an older copy, that copy is returned.
+    network fails and the index holds an older copy of exactly this address,
+    that copy is returned, marked stale. With refresh, only the network counts.
     """
     key = url.strip()
-    index = _get_index()
     if not refresh:
         cached = _document_cache.get(key)
         if cached is not None:
             return cached
-        if index is not None:
-            stored = await asyncio.to_thread(index.get, key, _max_age())
-            if stored is not None:
-                document = stored.document()
-                _document_cache.set(key, document)
-                return document
+        stored = await asyncio.to_thread(_stored, key, _max_age())
+        if stored is not None:
+            document = stored.document()
+            _document_cache.set(key, document)
+            return document
 
     async def work() -> Document:
         try:
@@ -148,9 +174,9 @@ async def _load(url: str, timeout: float = FETCH_TIMEOUT, refresh: bool = False)
                 downloaded = await download(key, total_timeout=timeout)
                 document = await asyncio.to_thread(extract, downloaded)
         except (FetchError, TimeoutError) as exc:
-            stale = await asyncio.to_thread(index.get, key) if index is not None else None
+            stale = None if refresh else await asyncio.to_thread(_stored, key, None)
             if stale is not None:  # offline or blocked: an old copy beats none
-                return stale.document()
+                return stale.document(stale=True)
             if isinstance(exc, TimeoutError):
                 raise FetchError("The page took too long to read.") from exc
             raise
@@ -171,6 +197,9 @@ def _local_hits(query: str, since: date | None) -> list[Hit]:
         embedder = embed.get_embedder()
         vector, model = (embedder.embed([query])[0], _model_id(embedder)) if embedder else (None, None)
         pages = index.search(query, LOCAL_RESULTS, vector, model)
+    except sqlite3.Error as exc:
+        _index_failure(exc)
+        return []
     except Exception as exc:
         log.warning("local index search failed: %s", exc)
         return []
@@ -266,6 +295,8 @@ async def _result(query: str, hit: Hit, contents: bool, highlights: int, include
                 result["content_error"] = "The page redirected to a site outside the domain filters."
                 return result
         result["title"] = hit.title or document.title
+        if document.stale:
+            result["stale"] = True
         if document.published and "published" not in result:
             result["published"] = document.published
         result["highlights"] = await asyncio.to_thread(_highlights, query, document.text, highlights)
@@ -378,7 +409,7 @@ async def fetch(url: str, query: str = "", max_chars: int = 12000, start: int = 
         query: Optional. Return only the passages matching these terms.
         max_chars: Maximum characters of text to return (500-60000).
         start: Character offset to continue from.
-        refresh: Read the page from the network even if a recent copy is stored.
+        refresh: Read the page from the network even if a recent copy is stored; fails if the network does.
     """
     max_chars = max(500, min(max_chars, 60000))
     start = max(0, start)
@@ -393,6 +424,10 @@ async def fetch(url: str, query: str = "", max_chars: int = 12000, start: int = 
         "total_chars": len(document.text),
         "truncated_download": document.truncated,
     }
+    if document.fetched_at:  # came from the local index: say how old the copy is
+        result["stored_copy_from"] = datetime.fromtimestamp(document.fetched_at, timezone.utc).date().isoformat()
+    if document.stale:
+        result["stale"] = True  # the network failed; this is an older stored copy
     if query.strip():
         result["highlights"] = await asyncio.to_thread(_highlights, query, document.text, 8)
         return result

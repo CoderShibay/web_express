@@ -211,15 +211,81 @@ async def test_stale_copies_are_refetched_and_used_if_the_network_fails(setup, m
     monkeypatch.setattr(server, "_document_cache", server.TTLCache(16, 60))
 
     monkeypatch.setenv("WEB_EXPRESS_MAX_AGE_DAYS", "0")  # everything stored counts as stale
-    await server._load("https://w.test/pizza")
-    assert len(loads) == 2
+    fresh = await server._load("https://w.test/pizza")
+    assert len(loads) == 2 and not fresh.stale
 
     monkeypatch.setattr(server, "_document_cache", server.TTLCache(16, 60))
     setup([], {"https://w.test/pizza": FetchError("Page answered HTTP 503.")})
     monkeypatch.setenv("WEB_EXPRESS_MAX_AGE_DAYS", "0")
-    assert (await server._load("https://w.test/pizza")).text == LONG  # the old copy beats an error
+    old = await server._load("https://w.test/pizza")
+    assert old.text == LONG and old.stale  # the old copy beats an error, and says what it is
+    out = await server.fetch("https://w.test/pizza")
+    assert out["stale"] is True and out["stored_copy_from"]
     with pytest.raises(FetchError):
         await server._load("https://w.test/never-seen")
+    with pytest.raises(RuntimeError, match="503"):  # an explicit refresh never settles for the old copy
+        await server.fetch("https://w.test/pizza", refresh=True)
+
+
+async def test_a_failing_index_never_blocks_reading_from_the_network(setup, monkeypatch):
+    import sqlite3
+
+    loads = setup([], {"https://w.test/pizza": doc("https://w.test/pizza", LONG)})
+
+    class Broken:
+        def get(self, *args):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        search = add = get
+
+    monkeypatch.setattr(server, "_index", Broken())
+    assert (await server._load("https://w.test/pizza")).text == LONG and loads == ["https://w.test/pizza"]
+    await server.flush()
+    assert server._index is None and server._index_failed  # switched off for this run
+
+    monkeypatch.setattr(server, "_index", Broken())
+    monkeypatch.setattr(server, "_index_failed", False)
+    setup([], {"https://w.test/gone": FetchError("Page answered HTTP 410.")})
+    monkeypatch.setattr(server, "_index", Broken())
+    with pytest.raises(FetchError, match="410"):  # the real error, not the database's
+        await server._load("https://w.test/gone")
+
+
+async def test_the_index_is_opened_once_even_under_concurrency(setup, monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    setup([])
+    opened = []
+    real = server.LocalIndex
+
+    def slow_open(*args, **kwargs):
+        time.sleep(0.05)
+        store = real(*args, **kwargs)
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr(server, "LocalIndex", slow_open)
+    barrier = threading.Barrier(8)
+
+    def ask():
+        barrier.wait()
+        return server._get_index()
+
+    with ThreadPoolExecutor(8) as pool:
+        stores = list(pool.map(lambda _: ask(), range(8)))
+    assert len(opened) == 1 and all(s is opened[0] for s in stores)
+
+
+async def test_secret_addresses_and_gate_pages_are_not_remembered(setup):
+    secret = "https://w.test/file?access_token=TOPSECRET"
+    wall = Document("https://w.test/wall", "Just a moment...", "Checking your browser. " * 12, None, "plain", False)
+    setup([], {secret: doc(secret, LONG), "https://w.test/wall": wall})
+    await server._load(secret)
+    await server._load("https://w.test/wall")
+    await server.flush()
+    assert server._get_index().stats()["pages"] == 0
 
 
 async def test_refresh_bypasses_stored_copies(setup):

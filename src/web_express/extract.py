@@ -21,6 +21,8 @@ class Document:
     published: str | None
     extractor: str  # which method produced the text
     truncated: bool  # the download hit the size limit
+    fetched_at: float | None = None  # set when the page came from the local index
+    stale: bool = False  # an old stored copy, served because the network failed
 
 
 class _PlainExtractor(HTMLParser):
