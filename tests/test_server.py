@@ -163,3 +163,19 @@ async def test_partial_answers_are_retried_sooner_than_complete_ones(setup, monk
     monkeypatch.setattr(server, "_partial_cache", server.TTLCache(16, 60))  # as if the short time limit passed
     out = await server.search("q", contents=False)
     assert out["sources_used"] == ["web1", "web2"] and len(server._search_cache) == 1
+
+
+async def test_results_are_reranked_by_meaning_when_the_model_is_ready(setup, monkeypatch):
+    from tests.test_ranking import FakeEmbedder
+
+    hits = [Hit("Pizza recipes from Naples", "https://w.test/1", source="web1"),
+            Hit("Something unrelated", "https://w.test/2", source="web1"),
+            Hit("How to abort a slow job", "https://w.test/3", source="web1")]
+    setup([Fake("web1", ("web",), hits)])
+    out = await server.search("stop it", contents=False)
+    assert [r["url"][-1] for r in out["results"]] == ["1", "2", "3"] and out["ranking"].startswith("keyword")
+
+    monkeypatch.setattr(server.embed, "get_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(server.embed, "status", lambda: "ready")
+    out = await server.search("stop it", contents=False, max_results=1)
+    assert out["results"][0]["url"] == "https://w.test/3" and out["ranking"] == "semantic"

@@ -12,14 +12,17 @@ try:  # mcp 2.x renamed FastMCP to MCPServer; support both
 except ImportError:
     from mcp.server.fastmcp import FastMCP
 
+from . import embed
 from .cache import TTLCache
 from .extract import Document, extract
 from .federation import FRESHNESS_DAYS, Federation, Outcome
 from .net import TOTAL_TIMEOUT, FetchError, download
-from .passages import split_passages, top_passages
+from .passages import split_passages
+from .ranking import best_passages, rerank
 from .sources import CATEGORIES, Hit
 
 PAGE_TIMEOUT = 12.0  # per page, when search reads pages on the caller's behalf
+RERANK_POOL = 30  # merged results considered before the best max_results are kept
 FETCH_TIMEOUT = TOTAL_TIMEOUT + 10.0  # download plus extraction, for an explicit fetch
 
 server = FastMCP(
@@ -102,13 +105,28 @@ def _clean_domains(domains: list[str] | None, name: str) -> list[str]:
 
 
 def _highlights(query: str, text: str, limit: int) -> list[dict]:
-    return [{"text": p.text, "start": p.start, "end": p.end} for p in top_passages(query, text, limit)]
+    best = best_passages(query, text, limit, embed.get_embedder())
+    return [{"text": p.text, "start": p.start, "end": p.end} for p in best]
 
 
 def _from_source(query: str, text: str, limit: int) -> list[dict]:
     """Highlights from text a source supplied (an abstract, an answer); no page offsets."""
-    best = top_passages(query, text, limit) or split_passages(text)[:1]
+    best = best_passages(query, text, limit, embed.get_embedder()) or split_passages(text)[:1]
     return [{"text": p.text} for p in best]
+
+
+def _rerank(query: str, hits: list[Hit]) -> list[Hit]:
+    """Reorder merged results by meaning, when the model is ready; otherwise leave them as merged."""
+    embedder = embed.get_embedder()
+    if embedder is None:
+        return hits
+    texts = [f"{h.title}. {(h.snippet or h.content or '')[:400]}" for h in hits]
+    return [hits[i] for i in rerank(query, texts, embedder)]
+
+
+def _ranking_note() -> str:
+    state = embed.status()
+    return "semantic" if state == "ready" else f"keyword (semantic model: {state})"
 
 
 async def _result(query: str, hit: Hit, contents: bool, highlights: int, include: list[str], exclude: list[str]) -> dict:
@@ -166,7 +184,9 @@ async def search(
     character offsets (pass `start` to fetch to read on from there); when it is
     "source", the text came from the source's own data (a paper's abstract, a
     Stack Overflow answer). A result that could not be read has `content_error`.
-    `source_errors` lists sources that did not answer.
+    `source_errors` lists sources that did not answer. `ranking` says whether
+    results and passages were ranked by meaning ("semantic") or by keywords only,
+    which happens until the small local model has finished its one-time download.
 
     Args:
         query: Search terms. "Quoted phrases" work.
@@ -209,7 +229,8 @@ async def search(
     if not outcome.used and outcome.errors:
         raise RuntimeError("No search source answered: " + " ".join(outcome.errors.values()))
 
-    hits = [h for h in outcome.hits if _allowed(h.url, include, exclude)][:max_results]
+    hits = [h for h in outcome.hits if _allowed(h.url, include, exclude)][:RERANK_POOL]
+    hits = (await asyncio.to_thread(_rerank, query, hits))[:max_results]
     results = list(await asyncio.gather(
         *(_result(query, h, contents, highlights_per_result, include, exclude) for h in hits)
     ))
@@ -218,6 +239,7 @@ async def search(
         "categories": outcome.categories,
         "sources_used": outcome.used,
         "cached": cached,
+        "ranking": _ranking_note(),
         "count": len(results),
         "results": results,
     }
