@@ -9,8 +9,7 @@ needs a second call to read a page.
 
 > Status: early (0.1.0). The tooling for all seven steps of the plan below is
 > built. It is not on a package index yet, and no pack or shared index has been
-> published. It is not yet published
-> to a package index, so install from a copy of this folder.
+> published.
 
 ## Tools
 
