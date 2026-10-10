@@ -37,6 +37,8 @@ def setup(monkeypatch):
             page = (pages or {}).get(url)
             if isinstance(page, Exception):
                 raise page
+            if page is None:
+                raise FetchError("Page answered HTTP 404.")
             return page
 
         monkeypatch.setattr(server, "download", fake_download)
@@ -179,3 +181,69 @@ async def test_results_are_reranked_by_meaning_when_the_model_is_ready(setup, mo
     monkeypatch.setattr(server.embed, "status", lambda: "ready")
     out = await server.search("stop it", contents=False, max_results=1)
     assert out["results"][0]["url"] == "https://w.test/3" and out["ranking"] == "semantic"
+
+
+LONG = "The margherita is a pizza from Naples made with tomato, mozzarella and basil. " * 6
+
+
+async def test_pages_read_once_come_back_from_the_local_index(setup, monkeypatch):
+    web = Fake("web1", ("web",), [Hit("Pizza", "https://w.test/pizza", source="web1")])
+    loads = setup([web], {"https://w.test/pizza": doc("https://w.test/pizza", LONG)})
+    await server.search("margherita pizza")
+    await server.flush()
+    assert server._get_index().stats()["pages"] == 1
+
+    # A later search, with the web source gone and memory caches empty, still finds and quotes the page.
+    from web_express.sources import SourceError
+
+    setup([Fake("web1", ("web",), SourceError("web1: offline."))], {})
+    out = await server.search("mozzarella basil")
+    result = out["results"][0]
+    assert out["sources_used"] == ["local"] and result["sources"] == ["local"] and result["details"]["fetched"]
+    assert result["content_from"] == "page" and "mozzarella" in result["highlights"][0]["text"]
+    assert loads == ["https://w.test/pizza"]  # read from the network once only
+
+
+async def test_stale_copies_are_refetched_and_used_if_the_network_fails(setup, monkeypatch):
+    loads = setup([], {"https://w.test/pizza": doc("https://w.test/pizza", LONG)})
+    await server._load("https://w.test/pizza")
+    await server.flush()
+    monkeypatch.setattr(server, "_document_cache", server.TTLCache(16, 60))
+
+    monkeypatch.setenv("WEB_EXPRESS_MAX_AGE_DAYS", "0")  # everything stored counts as stale
+    await server._load("https://w.test/pizza")
+    assert len(loads) == 2
+
+    monkeypatch.setattr(server, "_document_cache", server.TTLCache(16, 60))
+    setup([], {"https://w.test/pizza": FetchError("Page answered HTTP 503.")})
+    monkeypatch.setenv("WEB_EXPRESS_MAX_AGE_DAYS", "0")
+    assert (await server._load("https://w.test/pizza")).text == LONG  # the old copy beats an error
+    with pytest.raises(FetchError):
+        await server._load("https://w.test/never-seen")
+
+
+async def test_refresh_bypasses_stored_copies(setup):
+    loads = setup([], {"https://w.test/pizza": doc("https://w.test/pizza", LONG)})
+    await server.fetch("https://w.test/pizza")
+    await server.fetch("https://w.test/pizza")
+    assert len(loads) == 1
+    await server.fetch("https://w.test/pizza", refresh=True)
+    assert len(loads) == 2
+
+
+async def test_merging_local_results_does_not_alter_cached_answers(setup):
+    web = Fake("web1", ("web",), [Hit("Pizza", "https://w.test/pizza", source="web1")])
+    setup([web], {"https://w.test/pizza": doc("https://w.test/pizza", LONG)})
+    await server.search("margherita pizza")
+    await server.flush()
+    for _ in range(3):
+        out = await server.search("margherita pizza")
+        assert out["cached"] and out["results"][0]["sources"] == ["web1", "local"]
+
+
+async def test_the_index_can_be_switched_off(setup, monkeypatch):
+    monkeypatch.setenv("WEB_EXPRESS_INDEX", "off")
+    setup([], {"https://w.test/pizza": doc("https://w.test/pizza", LONG)})
+    await server._load("https://w.test/pizza")
+    await server.flush()
+    assert server._get_index() is None

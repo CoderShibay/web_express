@@ -7,14 +7,14 @@ One `search` call returns the results **and** the passages of each page that
 match the query, quoted verbatim with character offsets, so an agent rarely
 needs a second call to read a page.
 
-> Status: early. Steps 1 to 3 of the plan below are done.
+> Status: early. Steps 1 to 4 of the plan below are done.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `search` | Searches several sources at once, merges them, reads the top results and returns matching passages from each. Supports `category`, `include_domains`, `exclude_domains` and `freshness`. |
-| `fetch` | Reads one page or PDF as clean text, with paging. With `query`, returns only the matching passages. |
+| `fetch` | Reads one page or PDF as clean text, with paging. With `query`, returns only the matching passages. `refresh=True` skips stored copies. |
 
 ## Sources
 
@@ -65,6 +65,18 @@ field of each answer says which was used.
 Measured on an Apple M3: 0.6 s to load, about 9 ms per passage, about 160 MB
 of memory for the whole server.
 
+## Local index
+
+Every page web_express reads is stored in a private SQLite file,
+`~/.web_express/index.sqlite3`. Nothing in it leaves your computer.
+
+- A page read in the last 7 days is served from the index instead of the network.
+- Searches also look in the index, by words and by meaning, so pages you have
+  read before come back as results (source `local`), even offline.
+- If a page cannot be fetched and an older copy is stored, the older copy is used.
+- `fetch(url, refresh=True)` always reads from the network.
+- The oldest pages are dropped once the index passes 20,000 pages.
+
 ## Settings
 
 | Environment variable | Purpose |
@@ -72,6 +84,9 @@ of memory for the whole server.
 | `WEB_EXPRESS_CONTACT` | A URL or email address added to the user agent. Turns on Wikipedia, which refuses clients that give no contact. |
 | `WEB_EXPRESS_HOME` | Data folder. Default `~/.web_express`. |
 | `WEB_EXPRESS_MODEL` | `xsmall` (default) or `off` to rank by keywords only. |
+| `WEB_EXPRESS_INDEX` | `off` disables the local index. |
+| `WEB_EXPRESS_MAX_AGE_DAYS` | Days a stored page is served before it is fetched again. Default 7. |
+| `WEB_EXPRESS_MAX_PAGES` | Pages kept in the index. Default 20000. |
 | `WEB_EXPRESS_GITHUB_TOKEN` | Optional free token; raises GitHub's search limit. |
 | `WEB_EXPRESS_OPENALEX_KEY` | Optional free key; raises OpenAlex's daily allowance. |
 
@@ -102,7 +117,7 @@ highlights. Stack Overflow answers arrive through its official API instead.
 1. **Done:** safe fetching, clean extraction (HTML and PDF), one-call search with verbatim passages.
 2. **Done:** several search sources with category routing (papers, code, news) through free official APIs.
 3. **Done:** local semantic ranking with a small ONNX embedding model.
-4. A persistent local index of everything fetched.
+4. **Done:** a persistent local index of everything fetched.
 5. One-command installer and automatic agent configuration.
 6. Downloadable licence-clear corpus packs.
 7. A community-built open web index, grown in measured stages.
