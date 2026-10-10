@@ -36,6 +36,20 @@ def default_path() -> Path:
     return data_home() / "authority.sqlite3"
 
 
+def registrable_domain(host: str) -> str | None:
+    """The site a host belongs to, by the Public Suffix List: docs.python.org -> python.org.
+
+    Hosting suffixes are respected, so someone.github.io is its own site and does
+    not inherit github.io's standing.
+    """
+    try:
+        from tld import get_fld
+
+        return get_fld(host, fix_protocol=True, fail_silently=True)
+    except Exception:
+        return None
+
+
 def latest_release(client: httpx.Client) -> str:
     releases = client.get(RELEASES).raise_for_status().json()
     if not isinstance(releases, list) or not releases or not isinstance(releases[0], dict):
@@ -46,16 +60,40 @@ def latest_release(client: httpx.Client) -> str:
     return release
 
 
-def _lines(response: httpx.Response):
-    """Lines of a gzip-compressed text stream, decoded as they arrive."""
+def _lines(response: httpx.Response, max_bytes: int):
+    """Complete lines of a gzip-compressed text stream, decoded a little at a time.
+
+    Memory stays small whatever the stream expands to: at most max_bytes are ever
+    decompressed in total, in pieces of 64 KB. A stream that ends before its gzip
+    end marker is an error, and a final line is only yielded once that marker is seen.
+    """
     decoder = zlib.decompressobj(47)
     pending = b""
-    for raw in response.iter_raw():
-        pending += decoder.decompress(raw)
-        *lines, pending = pending.split(b"\n")
-        yield from lines
-        if len(pending) > 1_000_000:
-            raise RuntimeError("The ranks file has an unexpected layout.")
+    total = 0
+    try:
+        for raw in response.iter_raw():
+            while raw:
+                piece = decoder.decompress(raw, 65536)
+                raw = decoder.unconsumed_tail
+                total += len(piece)
+                if total > max_bytes:
+                    raise RuntimeError("The ranks file is far larger than expected.")
+                pending += piece
+                while True:
+                    end = pending.find(b"\n")
+                    if end < 0:
+                        break
+                    yield pending[:end]
+                    pending = pending[end + 1 :]
+                if len(pending) > 4096:
+                    raise RuntimeError("The ranks file has an unexpected layout.")
+                if decoder.eof:
+                    raw = b""
+        pending += decoder.flush()
+    except zlib.error as exc:
+        raise RuntimeError("The ranks file is damaged.") from exc
+    if not decoder.eof:
+        raise RuntimeError("The ranks file ended early; the download was incomplete.")
     if pending:
         yield pending
 
@@ -93,7 +131,7 @@ def install(top: int = DEFAULT_TOP, path: Path | None = None, transport: httpx.B
                 with client.stream("GET", RANKS.format(id=release)) as response:
                     response.raise_for_status()
                     batch = []
-                    for line in _lines(response):
+                    for line in _lines(response, max_bytes=top * 400 + 1_000_000):
                         row = parse_line(line)
                         if row is None:
                             continue
@@ -127,12 +165,13 @@ class Authority:
         self._lock = threading.Lock()
         self._db: sqlite3.Connection | None = None
         self._cache: dict[str, int | None] = {}
-        if self.path.is_file():
-            try:
-                self._db = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, check_same_thread=False)
+        try:
+            if self.path.is_file():
+                uri = f"{self.path.resolve().as_uri()}?mode=ro"
+                self._db = sqlite3.connect(uri, uri=True, check_same_thread=False)
                 self._db.execute("SELECT position FROM domains LIMIT 1").fetchall()
-            except sqlite3.Error:
-                self._db = None
+        except (sqlite3.Error, ValueError, OSError):
+            self._db = None
 
     @property
     def available(self) -> bool:
@@ -150,19 +189,19 @@ class Authority:
             return None
         try:
             host = (urlsplit(url).hostname or "").lower().rstrip(".")
-        except ValueError:
+            host = host.encode("idna").decode("ascii") if host else ""
+        except (ValueError, UnicodeError):
             return None
-        if not host:
-            return None
+        if not host or ":" in host or host.replace(".", "").isdigit():
+            return None  # no host, or an IP address: these have no site rank
         if host in self._cache:
             return self._cache[host]
-        labels = host.split(".")
-        # The list holds registrable domains: try the host, then each shorter suffix.
-        candidates = [".".join(labels[i:]) for i in range(len(labels) - 1)]
         position = None
         try:
             with self._lock:
-                for candidate in candidates:
+                for candidate in dict.fromkeys((host, registrable_domain(host))):
+                    if not candidate:
+                        continue
                     row = self._db.execute("SELECT position FROM domains WHERE domain = ?", (candidate,)).fetchone()
                     if row:
                         position = row[0]

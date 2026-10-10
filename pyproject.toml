@@ -18,6 +18,7 @@ dependencies = [
     "onnxruntime>=1.17",
     "tokenizers>=0.15",
     "numpy>=1.26",
+    "tld>=0.13",
 ]
 
 [project.optional-dependencies]

@@ -3,7 +3,7 @@ import gzip
 import httpx
 import pytest
 
-from web_express.authority import MAX_BONUS, Authority, install, parse_line
+from web_express.authority import MAX_BONUS, Authority, _lines, install, parse_line
 
 RANKS = b"""#harmonicc_pos\t#harmonicc_val\t#pr_pos\t#pr_val\t#host_rev\t#n_hosts
 1\t2.9E7\t3\t0.009\tcom.facebook\t3054
@@ -40,6 +40,7 @@ def test_install_keeps_only_the_top_domains_and_lookups_use_the_site_not_the_pag
     assert authority.position("https://www.bbc.co.uk/news") == 3
     assert authority.position("https://never-reached.com/") is None  # beyond the top 4
     assert authority.position("https://co.uk/") is None and authority.position("not a url") is None
+    assert authority.position("https://1.2.3.4/") is None and authority.position("https://[::1]/") is None
     assert authority.bonus("https://facebook.com/") == MAX_BONUS
     assert 0 < authority.bonus("https://example.com/x") < MAX_BONUS and authority.bonus("https://unknown.test/") == 0
 
@@ -61,3 +62,60 @@ def test_a_failed_install_leaves_the_previous_data_in_place(tmp_path):
         install(path=path, transport=transport(releases=[{"id": "../../etc"}]))
     assert Authority(path).position("https://facebook.com/") == 1
     assert [p.name for p in tmp_path.iterdir()] == ["authority.sqlite3"]
+
+
+def test_hosting_suffixes_and_international_names(tmp_path):
+    ranks = (b"1\t1\t1\t1\tio.github\t9\n2\t1\t1\t1\tuk.co\t9\n3\t1\t1\t1\tcom.xn--xample-9ua\t1\n"
+             b"4\t1\t1\t1\torg.python\t5\n5\t1\t1\t1\t4.3\t1\n")
+    path = tmp_path / "a.sqlite3"
+    install(path=path, transport=transport(ranks=ranks))
+    authority = Authority(path)
+    assert authority.position("https://github.io/") == 1
+    assert authority.position("https://attacker.github.io/") is None  # its own site, not github.io
+    assert authority.position("https://attacker.co.uk/") is None
+    assert authority.position("https://éxample.com/") == 3
+    assert authority.position("https://docs.python.org/3/") == 4
+    assert authority.position("https://1.2.3.4/") is None
+
+
+def test_relative_paths_work(tmp_path, monkeypatch):
+    install(top=2, path=tmp_path / "authority.sqlite3", transport=transport())
+    monkeypatch.chdir(tmp_path)
+    from pathlib import Path
+
+    assert Authority(Path("authority.sqlite3")).position("https://facebook.com/") == 1
+
+
+def test_a_truncated_download_is_an_error_and_keeps_the_old_data(tmp_path):
+    path = tmp_path / "authority.sqlite3"
+    install(top=2, path=path, transport=transport())
+    many = b"".join(b"%d\t1\t1\t1\tcom.site%d\t1\n" % (i, i) for i in range(1, 400))
+    cut = gzip.compress(many)[:-20]
+
+    def handler(request):
+        if request.url.path.endswith("graphinfo.json"):
+            return httpx.Response(200, json=[{"id": "cc-main-2026-test"}])
+        return httpx.Response(200, stream=httpx.ByteStream(cut))
+
+    with pytest.raises(RuntimeError, match="ended early|damaged"):
+        install(top=100_000, path=path, transport=httpx.MockTransport(handler))
+    assert Authority(path).info()["domains"] == "2"
+
+
+def test_a_highly_compressed_stream_is_read_in_small_pieces():
+    import tracemalloc
+
+    bomb = gzip.compress(b"x\n" * 5_000_000)
+    assert len(bomb) < 20_000
+
+    class Response:
+        def iter_raw(self):
+            yield bomb
+
+    tracemalloc.start()
+    with pytest.raises(RuntimeError, match="far larger"):
+        for _ in _lines(Response(), max_bytes=1_000_000):
+            pass
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 2_000_000

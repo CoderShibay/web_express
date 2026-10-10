@@ -345,17 +345,17 @@ async def test_site_authority_adds_a_rank_and_a_small_preference(setup, tmp_path
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE domains (domain TEXT PRIMARY KEY, position INTEGER NOT NULL) WITHOUT ROWID")
     db.execute("CREATE TABLE info (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    db.execute("INSERT INTO domains VALUES ('trusted.test', 3)")
+    db.execute("INSERT INTO domains VALUES ('trusted.org', 3)")
     db.commit()
     db.close()
     monkeypatch.setattr(server, "_authority", Authority(path))
     monkeypatch.setattr(server.embed, "get_embedder", lambda: FakeEmbedder())
     monkeypatch.setattr(server.embed, "status", lambda: "ready")
     # Two equally relevant results: the unknown site arrives first, the well-linked one second.
-    hits = [Hit("Cancel a task", "https://unknown.test/a", source="web1"), Hit("Cancel a task", "https://docs.trusted.test/b", source="web1")]
+    hits = [Hit("Cancel a task", "https://unknown.org/a", source="web1"), Hit("Cancel a task", "https://docs.trusted.org/b", source="web1")]
     setup([Fake("web1", ("web",), hits)])
     monkeypatch.setattr(server, "_authority", Authority(path))
     monkeypatch.setattr("web_express.ranking.ORDER_BONUS", 0.01)
     out = await server.search("cancel", contents=False)
-    assert [r["url"] for r in out["results"]] == ["https://docs.trusted.test/b", "https://unknown.test/a"]
+    assert [r["url"] for r in out["results"]] == ["https://docs.trusted.org/b", "https://unknown.org/a"]
     assert out["results"][0]["details"] == {"site_rank": 3} and "details" not in out["results"][1]

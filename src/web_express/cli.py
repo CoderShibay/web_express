@@ -502,7 +502,7 @@ def cmd_pack(args) -> int:
                       f"{pack.info.get('licence', '')} | {pack.info.get('attribution', '')}")
                 pack.close()
         elif args.action == "install":
-            info = packs.install(args.target, sha256=args.sha256)
+            info = packs.install(args.target, sha256=args.sha256, replace=args.replace)
             print(f"Installed {info['name']}: {info.get('pages', '?')} pages, licence {info.get('licence', '')}.")
             print(f"sha256 {info['sha256']}")
         elif args.action == "remove":
@@ -637,6 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument("action", choices=("list", "install", "remove", "build"))
     pack.add_argument("target", nargs="?", default="", help="pack name, or the file or https address to install")
     pack.add_argument("--sha256", help="install: refuse the pack unless it has this checksum")
+    pack.add_argument("--replace", action="store_true", help="install: replace an installed pack of the same name")
     pack.add_argument("--urls", help="build: a file with one address per line")
     pack.add_argument("--title", default="")
     pack.add_argument("--licence", default="", help="build: the licence the pages may be shared under")

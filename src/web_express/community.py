@@ -212,7 +212,7 @@ def install_from_manifest(manifest_path: Path) -> list[str]:
     installed = []
     for shard in manifest["shards"]:
         try:
-            installed.append(packs.install(str(folder / shard["file"]), sha256=shard["sha256"])["name"])
+            installed.append(packs.install(str(folder / shard["file"]), sha256=shard["sha256"], replace=True)["name"])
         except packs.PackError as exc:
             raise CommunityError(f"Shard {shard['file']} was refused: {exc}") from exc
     return installed
