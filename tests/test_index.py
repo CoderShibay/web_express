@@ -90,3 +90,15 @@ def test_queries_cannot_inject_search_operators(index):
     for query in ['"', 'words" OR "x', "NEAR(", "title:x", "a AND NOT b", "*", "-words", ""]:
         index.search(query)  # must not raise
     assert _match_expression('say "hi" NOT now') == '"say" OR "hi" OR "not" OR "now"'
+
+
+def test_common_words_alone_do_not_match(index):
+    index.add(doc("https://example.org/a", "Asyncio", "What a timeout is and how it works."))
+    assert index.search("what is the best way") == [] and _match_expression("what is it") == ""
+
+
+def test_a_shared_word_is_not_enough_when_the_meaning_is_far(index):
+    index.add(doc("https://example.org/1", "Python the snake", "The python is a large snake."), unit(1, 0, 0), "m")
+    index.add(doc("https://example.org/2", "Python the language", "Python is a programming language."), unit(0, 1, 0), "m")
+    found = index.search("python", query_vector=unit(0, 1, 0), model="m")
+    assert [p.url for p in found] == ["https://example.org/2"]

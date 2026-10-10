@@ -22,8 +22,11 @@ from pathlib import Path
 from .embed import data_home
 from .extract import Document
 from .federation import canonical_url
+from .passages import _STOPWORDS
 
 MAX_TEXT_CHARS = 300_000  # per page
+MIN_SIMILARITY = 0.35  # a page this close to the query matches by meaning
+KEYWORD_FLOOR = 0.20  # a page sharing words with the query but further than this in meaning is dropped
 SCHEMA_VERSION = 1
 _TERM = re.compile(r"[^\W_]+", re.UNICODE)
 
@@ -74,8 +77,8 @@ def _max_pages() -> int:
 
 
 def _match_expression(query: str) -> str:
-    """An FTS5 query matching any word of query; words are quoted, so no operator can be injected."""
-    terms = list(dict.fromkeys(t.lower() for t in _TERM.findall(query)))[:24]
+    """An FTS5 query matching any content word of query; words are quoted, so no operator can be injected."""
+    terms = [t for t in dict.fromkeys(t.lower() for t in _TERM.findall(query)) if t not in _STOPWORDS][:24]
     return " OR ".join(f'"{t}"' for t in terms)
 
 
@@ -180,6 +183,16 @@ class LocalIndex:
         """Pages matching query by words and, when a query vector is given, by meaning; best first."""
         scores: dict[int, float] = {}
         with self._lock:
+            closeness: dict[int, float] = {}
+            if query_vector is not None and model:
+                ids, matrix = self._vector_table(model)
+                if matrix is not None and matrix.shape[1] == len(query_vector):
+                    similarity = matrix @ query_vector
+                    closeness = dict(zip(ids, similarity.tolist()))
+                    best = similarity.argsort()[::-1][: limit * 3]
+                    for rank, position in enumerate(best):
+                        if similarity[position] >= MIN_SIMILARITY:  # not merely the least unrelated page
+                            scores[ids[position]] = scores.get(ids[position], 0.0) + 1.0 / (60 + rank + 1)
             expression = _match_expression(query)
             if expression:
                 rows = self._db.execute(
@@ -187,15 +200,9 @@ class LocalIndex:
                     (expression, limit * 3),
                 ).fetchall()
                 for rank, row in enumerate(rows):
+                    if closeness.get(row["rowid"], 1.0) < KEYWORD_FLOOR:
+                        continue  # shares a word with the query but is about something else
                     scores[row["rowid"]] = scores.get(row["rowid"], 0.0) + 1.0 / (60 + rank + 1)
-            if query_vector is not None and model:
-                ids, matrix = self._vector_table(model)
-                if matrix is not None and matrix.shape[1] == len(query_vector):
-                    similarity = matrix @ query_vector
-                    best = similarity.argsort()[::-1][: limit * 3]
-                    for rank, position in enumerate(best):
-                        if similarity[position] >= 0.35:  # not merely the least unrelated page
-                            scores[ids[position]] = scores.get(ids[position], 0.0) + 1.0 / (60 + rank + 1)
             if not scores:
                 return []
             ordered = sorted(scores, key=lambda i: -scores[i])
