@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from web_express import embed
-from web_express.ranking import best_passages, rerank
+from web_express.ranking import EMBED_PER_PAGE, _candidates, best_passages, rerank
 
 
 class FakeEmbedder:
@@ -105,3 +105,93 @@ def test_get_embedder_never_blocks_and_can_be_switched_off(tmp_path, monkeypatch
     embed.reset()
     assert embed.get_embedder() is None and embed.status().startswith("unavailable")
     embed.reset()
+
+
+def test_long_page_sampling_fills_every_slot_and_reaches_both_ends():
+    for total in (65, 66, 200, 1000):
+        chosen = _candidates(list(range(total)), [0.0] * total)  # no keyword matches at all
+        assert len(chosen) == len(set(chosen)) == EMBED_PER_PAGE and 0 in chosen and total - 1 in chosen
+    keyword = [0.0] * 200
+    keyword[150], keyword[7] = 3.0, 1.0
+    chosen = _candidates(sorted(range(200), key=lambda i: (-keyword[i], i)), keyword)
+    assert chosen[:2] == [150, 7] and len(chosen) == len(set(chosen)) == EMBED_PER_PAGE and 199 in chosen
+
+
+def test_broken_vectors_rank_last_instead_of_scrambling_the_order():
+    class Broken:
+        def embed(self, texts):
+            out = np.zeros((len(texts), 2), dtype=np.float32)
+            out[0] = [1, 0]
+            out[1] = [np.nan, 0]
+            out[2] = [0.9, 0]
+            return out
+
+    assert rerank("q", ["nan one", "good one"], Broken()) == [1, 0]
+
+
+# --- loading state ------------------------------------------------------------
+
+def wait_for(predicate, seconds=3.0):
+    import time
+
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_a_loader_started_before_a_reset_cannot_overwrite_newer_state(monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def slow_install(spec):
+        release.wait(3)
+        return embed.model_dir(spec)
+
+    monkeypatch.setenv("WEB_EXPRESS_MODEL", "xsmall")
+    monkeypatch.setattr(embed, "install", slow_install)
+    monkeypatch.setattr(embed, "Embedder", lambda spec, folder: object())
+    embed.reset()
+    assert embed.get_embedder() is None and embed.status() == "downloading"
+    embed.reset()
+    monkeypatch.setenv("WEB_EXPRESS_MODEL", "off")
+    assert embed.get_embedder() is None and embed.status() == "off"
+    release.set()
+    assert not wait_for(lambda: embed.status() != "off", 0.3)
+    assert embed.get_embedder() is None
+
+
+def test_corrupt_files_are_replaced_and_a_failed_load_is_retried_later(monkeypatch):
+    calls = []
+
+    def failing_then_fine(spec):
+        calls.append("install")
+        if len(calls) == 1:
+            raise OSError("network down")
+        return embed.model_dir(spec)
+
+    monkeypatch.setenv("WEB_EXPRESS_MODEL", "xsmall")
+    monkeypatch.setattr(embed, "install", failing_then_fine)
+    monkeypatch.setattr(embed, "Embedder", lambda spec, folder: "the embedder")
+    embed.reset()
+    assert embed.get_embedder() is None
+    assert wait_for(lambda: embed.status().startswith("unavailable"))
+    assert embed.get_embedder() is None and calls == ["install"]  # not retried straight away
+
+    monkeypatch.setattr(embed, "_retry_at", 0.0)  # as if the delay has passed
+    assert embed.get_embedder() is None
+    assert wait_for(lambda: embed.status() == "ready") and embed.get_embedder() == "the embedder"
+
+
+def test_install_redownloads_a_file_that_is_present_but_wrong(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEB_EXPRESS_HOME", str(tmp_path))
+    spec = spec_for({"model.onnx": ("onnx/m.onnx", hashlib.sha256(b"weights").hexdigest())})
+    folder = embed.model_dir(spec)
+    folder.mkdir(parents=True)
+    (folder / "model.onnx").write_bytes(b"garbage")
+    assert embed.is_installed(spec)  # present, but that proves nothing
+    embed.install(spec, transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"weights")))
+    assert (folder / "model.onnx").read_bytes() == b"weights"

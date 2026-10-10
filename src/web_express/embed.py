@@ -15,6 +15,8 @@ import hashlib
 import logging
 import os
 import threading
+import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,7 +86,7 @@ def install(spec: ModelSpec, transport: httpx.BaseTransport | None = None) -> Pa
             target = folder / name
             if target.is_file() and _sha256(target) == expected:
                 continue
-            partial = folder / f"{name}.part-{os.getpid()}"
+            partial = folder / f"{name}.part-{os.getpid()}-{uuid.uuid4().hex[:8]}"
             digest = hashlib.sha256()
             try:
                 url = f"https://huggingface.co/{spec.repo}/resolve/{spec.revision}/{remote}"
@@ -149,7 +151,8 @@ class Embedder:
             }
             if "token_type_ids" in self._inputs:
                 feed["token_type_ids"] = np.zeros_like(feed["input_ids"])
-            vectors = self._session.run([self.spec.output], feed)[0].astype(np.float32)
+            vectors = np.nan_to_num(self._session.run([self.spec.output], feed)[0].astype(np.float32),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
             vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
             with self._lock:
                 for i, vector in zip(batch, vectors):
@@ -161,49 +164,67 @@ class Embedder:
 
 
 _state_lock = threading.Lock()
+_install_lock = threading.Lock()  # one download at a time in this process
 _embedder: Embedder | None = None
-_status = "not loaded"  # not loaded | downloading | ready | off | unavailable: <reason>
+_status = "not loaded"  # not loaded | loading | downloading | ready | off | unavailable: <reason>
+_generation = 0  # bumped by reset(); a loader started before a reset must not commit its result
+_failures = 0
+_retry_at = 0.0  # monotonic time before which a failed load is not retried
+RETRY_BASE = 60.0
+RETRY_MAX = 3600.0
 
 
 def status() -> str:
     return _status
 
 
-def _prepare(spec: ModelSpec, download: bool) -> None:
-    global _embedder, _status
+def _prepare(spec: ModelSpec, generation: int) -> None:
+    global _embedder, _status, _failures, _retry_at
     try:
-        if download:
-            install(spec)
-        embedder = Embedder(spec, model_dir(spec))
+        with _install_lock:
+            folder = install(spec)  # verifies checksums; downloads only what is missing or corrupt
+        embedder = Embedder(spec, folder)
         with _state_lock:
-            _embedder, _status = embedder, "ready"
+            if generation == _generation:
+                _embedder, _status, _failures = embedder, "ready", 0
     except Exception as exc:  # no network, unsupported platform, broken file: keep working without it
         log.warning("semantic ranking is unavailable: %s", exc)
         with _state_lock:
-            _status = f"unavailable: {type(exc).__name__}"
+            if generation == _generation:
+                _failures += 1
+                _retry_at = time.monotonic() + min(RETRY_BASE * 2 ** (_failures - 1), RETRY_MAX)
+                _status = f"unavailable: {type(exc).__name__}"
 
 
 def get_embedder() -> Embedder | None:
-    """The embedder if it is ready, else None. Starts loading in the background on first call."""
+    """The embedder if it is ready, else None.
+
+    Starts loading in the background on first call, and again after a failure
+    once a growing delay has passed. Never blocks.
+    """
     global _status
     if _embedder is not None:
         return _embedder
     with _state_lock:
-        if _status != "not loaded":
+        if _embedder is not None:
             return _embedder
+        failed = _status.startswith("unavailable") and _failures > 0
+        if _status != "not loaded" and not (failed and time.monotonic() >= _retry_at):
+            return None
         choice = os.environ.get("WEB_EXPRESS_MODEL", "xsmall").strip().lower()
         spec = MODELS.get(choice)
         if spec is None:
             _status = "off" if choice == "off" else f"unavailable: unknown model {choice!r}"
             return None
-        installed = is_installed(spec)
-        _status = "loading" if installed else "downloading"
-    threading.Thread(target=_prepare, args=(spec, not installed), name="web_express-model", daemon=True).start()
+        _status = "loading" if is_installed(spec) else "downloading"
+        generation = _generation
+    threading.Thread(target=_prepare, args=(spec, generation), name="web_express-model", daemon=True).start()
     return None
 
 
 def reset() -> None:
     """Forget the loaded model (used by tests and by `web-express setup`)."""
-    global _embedder, _status
+    global _embedder, _status, _generation, _failures, _retry_at
     with _state_lock:
-        _embedder, _status = None, "not loaded"
+        _generation += 1
+        _embedder, _status, _failures, _retry_at = None, "not loaded", 0, 0.0

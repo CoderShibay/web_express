@@ -7,6 +7,8 @@ works before the model has been downloaded.
 
 from __future__ import annotations
 
+import math
+
 from .passages import Passage, rank_passages, split_passages
 
 EMBED_PER_PAGE = 64  # passages embedded per page; a longer page is sampled
@@ -15,14 +17,28 @@ ORDER_BONUS = 0.10  # added to similarity for the top incoming result, less down
 MIN_SIMILARITY = 0.35  # below this a passage is not about the query
 
 
-def _candidates(keyword_order: list[int], total: int) -> list[int]:
-    """Which passages to embed: all of a short page; the best keyword matches plus an even sample of a long one."""
+def _candidates(keyword_order: list[int], keyword: list[float]) -> list[int]:
+    """Which passages to embed: all of a short page; for a long one, the best keyword
+    matches plus an even sample of the rest, from the first passage to the last."""
+    total = len(keyword)
     if total <= EMBED_PER_PAGE:
         return list(range(total))
-    keep = keyword_order[: EMBED_PER_PAGE * 2 // 3]
-    step = total / (EMBED_PER_PAGE - len(keep))
-    sample = [int(i * step) for i in range(EMBED_PER_PAGE - len(keep))]
-    return list(dict.fromkeys(keep + sample))
+    keep = [i for i in keyword_order[: EMBED_PER_PAGE * 2 // 3] if keyword[i] > 0]
+    chosen = set(keep)
+    rest = [i for i in range(total) if i not in chosen]
+    wanted = EMBED_PER_PAGE - len(keep)
+    if wanted >= len(rest):
+        sample = rest
+    elif wanted == 1:
+        sample = rest[:1]
+    else:
+        sample = [rest[round(j * (len(rest) - 1) / (wanted - 1))] for j in range(wanted)]
+    return keep + list(dict.fromkeys(sample))
+
+
+def _similarities(vectors) -> list[float]:
+    """Similarity of each text to the query (row 0); a broken value counts as unrelated."""
+    return [s if math.isfinite(s) else -1.0 for s in (vectors[1:] @ vectors[0]).tolist()]
 
 
 def best_passages(query: str, text: str, limit: int, embedder=None) -> list[Passage]:
@@ -35,9 +51,8 @@ def best_passages(query: str, text: str, limit: int, embedder=None) -> list[Pass
     if embedder is None:
         return [passages[i] for i in keyword_order[:limit] if keyword[i] > 0]
 
-    candidates = _candidates(keyword_order, len(passages))
-    vectors = embedder.embed([query] + [passages[i].text for i in candidates])
-    similarity = (vectors[1:] @ vectors[0]).tolist()
+    candidates = _candidates(keyword_order, keyword)
+    similarity = _similarities(embedder.embed([query] + [passages[i].text for i in candidates]))
     top_keyword = max(keyword) or 1.0
     scored = []
     for j, i in enumerate(candidates):
@@ -56,7 +71,6 @@ def rerank(query: str, texts: list[str], embedder=None) -> list[int]:
     count = len(texts)
     if embedder is None or count < 2:
         return list(range(count))
-    vectors = embedder.embed([query] + texts)
-    similarity = (vectors[1:] @ vectors[0]).tolist()
+    similarity = _similarities(embedder.embed([query] + texts))
     score = [similarity[i] + ORDER_BONUS * (1 - i / (count - 1)) for i in range(count)]
     return sorted(range(count), key=lambda i: (-score[i], i))
