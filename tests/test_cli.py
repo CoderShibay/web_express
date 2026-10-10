@@ -95,3 +95,89 @@ def test_status_and_index_commands(capsys, monkeypatch):
     assert cli.main(["setup"]) == 0 and "switched off" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         cli.main(["search"])
+
+
+def test_rewritten_configs_keep_their_permissions(tmp_path):
+    import os
+    import stat
+
+    if os.name == "nt":
+        pytest.skip("POSIX permissions")
+    for name, register in (("mcp.json", cli.register_json), ("config.toml", cli.register_codex)):
+        path = tmp_path / name
+        path.write_text("{}" if name.endswith("json") else "")
+        path.chmod(0o600)
+        old = os.umask(0o022)
+        try:
+            assert register(path, COMMAND).startswith("registered")
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        backups = list(tmp_path.glob(name + ".bak-web_express-*"))
+        assert backups and all(stat.S_IMODE(b.stat().st_mode) == 0o600 for b in backups)
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_backups_made_in_the_same_second_do_not_overwrite_each_other(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text('{"original": true}')
+    cli.register_json(path, COMMAND)
+    cli.register_json(path, ["other"])
+    cli.register_json(path, COMMAND)
+    backups = sorted(tmp_path.glob("mcp.json.bak-web_express-*"))
+    assert len(backups) == 3 and any(json.loads(b.read_text()) == {"original": True} for b in backups)
+
+
+def test_json_keeps_extra_settings_and_a_byte_order_mark(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"mcpServers": {"web_express": {"command": "old", "env": {"K": "v"}}}}).encode())
+    assert cli.register_json(path, COMMAND).startswith("registered in")
+    raw = path.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    assert json.loads(raw[3:])["mcpServers"]["web_express"] == {"command": COMMAND[0], "env": {"K": "v"}, "args": []}
+
+
+def test_codex_update_keeps_other_settings_comments_and_line_endings(tmp_path):
+    path = tmp_path / "config.toml"
+    original = ('# my settings\r\nmodel = "gpt"\r\n\r\n[mcp_servers.web_express]  # search\r\ncommand = "old"\r\nargs = []\r\n'
+                'startup_timeout_sec = 30\r\nenv = { TOKEN = "secret" }\r\n# keep me\r\n\r\n[mcp_servers.web_express.extra]\r\nx = 1\r\n')
+    path.write_bytes(original.encode())
+    assert cli.register_codex(path, COMMAND).startswith("registered in")
+    text = path.read_bytes().decode()
+    table = tomllib.loads(text)["mcp_servers"]["web_express"]
+    assert table == {"command": COMMAND[0], "args": [], "startup_timeout_sec": 30, "env": {"TOKEN": "secret"}, "extra": {"x": 1}}
+    assert "# my settings" in text and "# keep me" in text and "# search" in text and "\n" not in text.replace("\r\n", "")
+
+
+def test_codex_remove_takes_sub_tables_too(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[mcp_servers.other]\nurl = "u"\n\n[mcp_servers.web_express]\ncommand = "x"\nargs = []\n\n'
+                    '[mcp_servers.web_express.env]\nTOKEN = "secret"\n\n[profiles.fast]\nmodel = "m"\n')
+    assert cli.register_codex(path, COMMAND, remove=True).startswith("removed from")
+    data = tomllib.loads(path.read_text())
+    assert data == {"mcp_servers": {"other": {"url": "u"}}, "profiles": {"fast": {"model": "m"}}}
+    assert "secret" not in path.read_text()
+
+
+def test_codex_refuses_layouts_it_cannot_edit_exactly(tmp_path):
+    path = tmp_path / "config.toml"
+    cases = ['mcp_servers = 42\n',
+             '[mcp_servers]\nweb_express = 7\n',
+             '[mcp_servers.web_express]\ncommand = "old"\nargs = [\n  "a",\n  "b",\n]\n',  # value over several lines
+             '[mcp_servers]\nweb_express.command = "old"\n']                               # dotted keys
+    for content in cases:
+        path.write_text(content)
+        assert cli.register_codex(path, COMMAND).startswith("skipped") and path.read_text() == content
+    assert not list(tmp_path.glob("*.bak-*"))
+
+
+def test_init_exit_code_reports_problems(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_home", lambda: tmp_path)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    assert cli.main(["init"]) == 0  # nothing installed is not an error when asking for all
+    assert cli.main(["init", "--client", "cursor"]) == 1  # but the one asked for is missing
+    (tmp_path / ".cursor").mkdir()
+    (tmp_path / ".cursor" / "mcp.json").write_text("{ // comments\n}")
+    assert cli.main(["init", "--client", "cursor"]) == 1 and "skipped" in capsys.readouterr().out
+    (tmp_path / ".cursor" / "mcp.json").write_text("{}")
+    assert cli.main(["init", "--client", "cursor"]) == 0

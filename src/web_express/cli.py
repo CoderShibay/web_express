@@ -15,9 +15,11 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -67,15 +69,35 @@ def codex_config() -> Path:
 
 
 def _backup(path: Path) -> Path:
-    copy = path.with_name(f"{path.name}.bak-web_express-{time.strftime('%Y%m%d-%H%M%S')}")
-    shutil.copy2(path, copy)
-    return copy
+    """Copy path to a new backup file beside it. Never overwrites an earlier backup."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for attempt in range(1000):
+        suffix = f".bak-web_express-{stamp}" + (f"-{attempt}" if attempt else "")
+        copy = path.with_name(path.name + suffix)
+        try:
+            with copy.open("xb") as handle:  # fails if the name is taken, so two runs cannot share a backup
+                handle.write(path.read_bytes())
+        except FileExistsError:
+            continue
+        shutil.copymode(path, copy)
+        return copy
+    raise OSError(f"could not create a backup of {path}")
 
 
-def _write(path: Path, text: str) -> None:
-    partial = path.with_name(path.name + ".web_express-tmp")
-    partial.write_text(text, encoding="utf-8")
-    os.replace(partial, path)
+def _write(path: Path, data: bytes) -> None:
+    """Replace path with data in one step, keeping its permissions (these files can hold tokens)."""
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    handle, partial = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")  # created 0600
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(partial, mode)
+        os.replace(partial, path)
+    except BaseException:
+        Path(partial).unlink(missing_ok=True)
+        raise
 
 
 def register_json(path: Path, command: list[str], remove: bool = False, dry_run: bool = False) -> str:
@@ -83,9 +105,12 @@ def register_json(path: Path, command: list[str], remove: bool = False, dry_run:
     if not path.parent.is_dir():
         return "not installed"
     data: dict = {}
+    bom = b""
     if path.is_file():
+        raw = path.read_bytes()
+        bom = b"\xef\xbb\xbf" if raw.startswith(b"\xef\xbb\xbf") else b""
         try:
-            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+            data = json.loads(raw[len(bom):].decode("utf-8") or "{}")
         except ValueError:
             return f"skipped: {path} is not plain JSON; add the server by hand"
         if not isinstance(data, dict):
@@ -95,63 +120,130 @@ def register_json(path: Path, command: list[str], remove: bool = False, dry_run:
         servers = {}
     if not isinstance(servers, dict):
         return f"skipped: {path} has an unexpected layout"
-    entry = {"command": command[0], "args": command[1:]}
+    existing = servers.get(SERVER_NAME)
     if remove:
         if SERVER_NAME not in servers:
             return "not registered"
         del servers[SERVER_NAME]
-    elif servers.get(SERVER_NAME) == entry:
-        return "already registered"
     else:
+        if existing is not None and not isinstance(existing, dict):
+            return f"skipped: {path} has an unexpected layout"
+        entry = dict(existing or {})  # keep any extra settings the user added, such as env
+        entry["command"], entry["args"] = command[0], command[1:]
+        if entry == existing:
+            return "already registered"
         servers[SERVER_NAME] = entry
     data["mcpServers"] = servers
     if dry_run:
         return f"would {'remove from' if remove else 'update'} {path}"
     backup = f" (backup: {_backup(path).name})" if path.is_file() else ""
-    _write(path, json.dumps(data, indent=2) + "\n")
+    _write(path, bom + (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
     return f"{'removed from' if remove else 'registered in'} {path}{backup}"
 
 
 def _toml_string(value: str) -> str:
-    return json.dumps(value)  # JSON string syntax is valid TOML basic-string syntax
+    return json.dumps(value, ensure_ascii=False)  # JSON string syntax is valid TOML basic-string syntax
+
+
+_TABLE_HEADER = re.compile(r"^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$")
+
+
+def _header_name(line: str) -> str | None:
+    match = _TABLE_HEADER.match(line.rstrip("\r\n"))
+    return re.sub(r"\s*\.\s*", ".", match.group(1)) if match else None
 
 
 def register_codex(path: Path, command: list[str], remove: bool = False, dry_run: bool = False) -> str:
-    """Add or remove the [mcp_servers.web_express] table in Codex's config.toml."""
+    """Add or remove the [mcp_servers.web_express] table in Codex's config.toml.
+
+    Only the `command` and `args` lines are written; every other line, including
+    other settings in the same table, comments and line endings, is left as it is.
+    If the file is laid out in a way this cannot edit safely, nothing is changed.
+    """
     import tomllib
 
     if not path.parent.is_dir():
         return "not installed"
-    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    by_hand = f"skipped: could not edit {path} safely; add the server by hand"
     try:
+        text = path.read_bytes().decode("utf-8") if path.is_file() else ""
         current = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
         return f"skipped: {path} is not valid TOML; add the server by hand"
-    header = f"[mcp_servers.{SERVER_NAME}]"
-    present = SERVER_NAME in (current.get("mcp_servers") or {})
-    block = f"{header}\ncommand = {_toml_string(command[0])}\nargs = [{', '.join(_toml_string(a) for a in command[1:])}]\n"
-    if present:
-        lines = text.splitlines(keepends=True)
-        start = next((i for i, line in enumerate(lines) if line.strip() == header), None)
-        if start is None:
-            return f"skipped: {path} defines {SERVER_NAME} in a form web-express will not rewrite; edit it by hand"
-        end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
-        existing = current["mcp_servers"][SERVER_NAME]
-        if not remove and existing == {"command": command[0], "args": command[1:]}:
-            return "already registered"
-        new_text = "".join(lines[:start]) + ("" if remove else block + ("\n" if end < len(lines) else "")) + "".join(lines[end:])
+    servers = current.get("mcp_servers", {})
+    if not isinstance(servers, dict) or not isinstance(servers.get(SERVER_NAME, {}), dict):
+        return f"skipped: {path} has an unexpected layout"
+    newline = "\r\n" if "\r\n" in text else "\n"
+    table = f"mcp_servers.{SERVER_NAME}"
+    wanted = {"command": command[0], "args": command[1:]}
+    new_lines = [f"command = {_toml_string(command[0])}", f"args = [{', '.join(_toml_string(a) for a in command[1:])}]"]
+    existing = servers.get(SERVER_NAME)
+    lines = text.splitlines(keepends=True)
+
+    def spans(prefix_too: bool) -> list[tuple[int, int]]:
+        """Line ranges of the server's table, and of its sub-tables when prefix_too."""
+        found, start = [], None
+        for number, line in enumerate(lines + ["[end]"]):
+            name = _header_name(line)
+            if name is None:
+                continue
+            if start is not None:
+                found.append((start, number))
+                start = None
+            if name == table or (prefix_too and name.startswith(table + ".")):
+                start = number
+        return found
+
+    if existing is None:
+        if remove:
+            return "not registered"
+        if not text or text.endswith(("\n\n", "\r\n\r\n")):
+            gap = ""
+        elif text.endswith("\n"):
+            gap = newline
+        else:
+            gap = newline * 2
+        new_text = text + gap + newline.join([f"[{table}]", *new_lines]) + newline
     elif remove:
-        return "not registered"
+        doomed = spans(prefix_too=True)
+        if not doomed:
+            return by_hand
+        keep = [line for number, line in enumerate(lines) if not any(a <= number < b for a, b in doomed)]
+        new_text = "".join(keep)
     else:
-        new_text = text + ("" if not text or text.endswith("\n\n") else "\n" if text.endswith("\n") else "\n\n") + block
+        if {k: existing.get(k) for k in wanted} == wanted:
+            return "already registered"
+        own = spans(prefix_too=False)
+        if len(own) != 1:
+            return by_hand
+        start, end = own[0]
+        body = []
+        for line in lines[start + 1 : end]:
+            if re.match(r"\s*(command|args)\s*=", line):
+                continue  # replaced below; a value spread over several lines fails the check afterwards
+            body.append(line)
+        new_text = "".join(lines[:start] + [lines[start].rstrip("\r\n") + newline]
+                           + [entry + newline for entry in new_lines] + body + lines[end:])
+
+    # Prove the edit did exactly what was intended and nothing else, or refuse it.
     try:
-        tomllib.loads(new_text)
+        after = tomllib.loads(new_text)
     except tomllib.TOMLDecodeError:
-        return f"skipped: could not edit {path} safely; add the server by hand"
+        return by_hand
+    expected = json.loads(json.dumps(current, default=str))
+    expected_servers = expected.setdefault("mcp_servers", {})
+    if remove:
+        expected_servers.pop(SERVER_NAME, None)
+        if not expected_servers and "mcp_servers" not in after:
+            expected.pop("mcp_servers")
+    else:
+        expected_servers[SERVER_NAME] = {**(existing or {}), **wanted}
+    if json.loads(json.dumps(after, default=str)) != json.loads(json.dumps(expected, default=str)):
+        return by_hand
     if dry_run:
         return f"would {'remove from' if remove else 'update'} {path}"
     backup = f" (backup: {_backup(path).name})" if path.is_file() else ""
-    _write(path, new_text)
+    _write(path, new_text.encode("utf-8"))
     return f"{'removed from' if remove else 'registered in'} {path}{backup}"
 
 
@@ -272,7 +364,10 @@ def cmd_init(args) -> int:
         print(f"{client.ljust(width)}  {outcome}")
     if not args.dry_run and not args.remove and any(o.startswith("registered") for o in results.values()):
         print("\nRestart those agents to load web_express.")
-    return 0
+    problems = [o for o in results.values() if o.startswith(("failed", "skipped"))]
+    if args.client != "all" and results[args.client] == "not installed":
+        problems.append("not installed")  # the one agent asked for is not here
+    return 1 if problems else 0
 
 
 def cmd_search(args) -> int:
