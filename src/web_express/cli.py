@@ -7,6 +7,9 @@
     web-express search QUERY    run a search from the terminal
     web-express fetch URL       read a page from the terminal
     web-express index ...       inspect or clear the local index
+    web-express pack ...        build, install, list or remove corpus packs
+    web-express authority ...   install or inspect the site-ranking data
+    web-express community ...   propose addresses and build or install shared shards
 """
 
 from __future__ import annotations
@@ -334,9 +337,20 @@ def status() -> dict:
         "data_folder": str(embed.data_home()),
         "ranking_model": "off" if spec is None else (f"{spec.name} (installed)" if embed.is_installed(spec) else f"{spec.name} (not downloaded yet)"),
         "sources": {s.name: "on" if s.available() else "off (needs WEB_EXPRESS_CONTACT)" for s in default_sources()},
+        "packs": [],
+        "site_ranking": "not installed",
         "settings": {name: "set" if os.environ.get(name, "").strip() else "not set"
                      for name in ("WEB_EXPRESS_CONTACT", "WEB_EXPRESS_GITHUB_TOKEN", "WEB_EXPRESS_OPENALEX_KEY")},
     }
+    from . import authority, packs
+
+    for pack in packs.installed():
+        report["packs"].append(f"{pack.name} ({pack.info.get('pages', '?')} pages, {pack.info.get('licence', '')})")
+        pack.close()
+    ranks = authority.Authority()
+    if ranks.available:
+        details = ranks.info()
+        report["site_ranking"] = f"{details.get('domains', '?')} sites from {details.get('release', '?')}"
     if not index.enabled():
         report["local_index"] = "off"
     elif not index.default_path().exists():
@@ -454,6 +468,137 @@ def cmd_index(args) -> int:
     return 0
 
 
+def _load_embedder():
+    """The ranking model, loaded now (builds wait for it; searches never do). None if unavailable."""
+    from . import embed
+    from .server import _model_id
+
+    spec = embed.MODELS.get(os.environ.get("WEB_EXPRESS_MODEL", "xsmall").strip().lower())
+    if spec is None:
+        return None, None
+    try:
+        embedder = embed.Embedder(spec, embed.install(spec))
+    except Exception as exc:
+        print(f"Building without search-by-meaning vectors: the model is unavailable ({exc}).", file=sys.stderr)
+        return None, None
+    return embedder, _model_id(embedder)
+
+
+def _read_lines(path: str) -> list[str]:
+    return [line.strip() for line in Path(path).expanduser().read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
+def cmd_pack(args) -> int:
+    from . import packs
+
+    try:
+        if args.action == "list":
+            found = packs.installed()
+            if not found:
+                print("No packs are installed.")
+            for pack in found:
+                print(f"{pack.name}: {pack.info.get('title', '')} | {pack.info.get('pages', '?')} pages | "
+                      f"{pack.info.get('licence', '')} | {pack.info.get('attribution', '')}")
+                pack.close()
+        elif args.action == "install":
+            info = packs.install(args.target, sha256=args.sha256)
+            print(f"Installed {info['name']}: {info.get('pages', '?')} pages, licence {info.get('licence', '')}.")
+            print(f"sha256 {info['sha256']}")
+        elif args.action == "remove":
+            print("Removed." if packs.remove(args.target) else "No pack of that name is installed.")
+        elif args.action == "build":
+            for needed in ("urls", "title", "licence", "attribution"):
+                if not getattr(args, needed):
+                    print(f"pack build needs --{needed}.", file=sys.stderr)
+                    return 1
+            embedder, model_id = _load_embedder()
+            output = Path(args.output or f"{args.target}.pack").expanduser()
+            built = asyncio.run(packs.build(
+                args.target, _read_lines(args.urls), output, title=args.title, licence=args.licence,
+                attribution=args.attribution, source=args.source, embedder=embedder, model_id=model_id,
+                progress=lambda number, url: print(f"  {number}: {url}"),
+            ))
+            print(f"Wrote {built['file']}: {built['pages']} pages.\nsha256 {built['sha256']}")
+            for url, reason in built["failed"].items():
+                print(f"  skipped {url}: {reason}")
+    except (packs.PackError, OSError) as exc:
+        print(f"Pack {args.action} failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_authority(args) -> int:
+    from . import authority
+
+    if args.action == "install":
+        print(f"Downloading the {args.top:,} best-linked sites from Common Crawl's web graph...")
+        try:
+            info = authority.install(top=args.top, progress=lambda count: print(f"  {count:,}", end="\r"))
+        except Exception as exc:
+            print(f"Install failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"Stored {info['domains']:,} sites from release {info['release']}.")
+        return 0
+    ranks = authority.Authority()
+    if not ranks.available:
+        print("Site-ranking data is not installed. Run: web-express authority install")
+        return 0
+    _print_json(ranks.info())
+    return 0
+
+
+def cmd_community(args) -> int:
+    from . import authority, community, index, packs
+
+    try:
+        if args.action == "export":
+            if not index.enabled() or not index.default_path().exists():
+                print("The local index is empty; there is nothing to propose.")
+                return 0
+            store = index.LocalIndex()
+            try:
+                count = community.export_nominations(store, Path(args.paths[0]).expanduser(), args.limit)
+            finally:
+                store.close()
+            print(f"Wrote {count} addresses to {args.paths[0]}. Nothing was sent anywhere; share the file if you choose to.")
+        elif args.action == "select":
+            if not args.output:
+                print("community select needs --output.", file=sys.stderr)
+                return 1
+            blocked = set(_read_lines(args.blocked)) if args.blocked else set()
+            ranks = authority.Authority()
+            chosen, report = community.select(
+                [Path(p).expanduser() for p in args.paths], quorum=args.quorum, per_site=args.per_site,
+                authority=ranks, max_site_rank=args.max_site_rank, blocked=blocked,
+            )
+            Path(args.output).expanduser().write_text("\n".join(chosen) + ("\n" if chosen else ""), encoding="utf-8")
+            if not ranks.available:
+                report["note"] = "site-ranking data is not installed, so the site-rank rule was not applied"
+            _print_json(report)
+        elif args.action == "build":
+            for needed in ("name", "licence", "attribution", "output"):
+                if not getattr(args, needed):
+                    print(f"community build needs --{needed}.", file=sys.stderr)
+                    return 1
+            embedder, model_id = _load_embedder()
+            result = asyncio.run(community.build_shards(
+                _read_lines(args.paths[0]), Path(args.output).expanduser(), name=args.name, licence=args.licence,
+                attribution=args.attribution, shard_size=args.shard_size, embedder=embedder, model_id=model_id,
+                rules={"quorum": args.quorum, "per_site": args.per_site, "max_site_rank": args.max_site_rank},
+                progress=lambda number, url: print(f"  {number}: {url}"),
+            ))
+            print(f"Built {len(result['shards'])} shards, {result['pages']} pages, {result['unreadable']} unreadable. "
+                  f"Manifest: {Path(args.output).expanduser() / 'manifest.json'}")
+        elif args.action == "install":
+            names = community.install_from_manifest(Path(args.paths[0]).expanduser())
+            print(f"Installed {len(names)} shards: {', '.join(names)}")
+    except (community.CommunityError, packs.PackError, OSError) as exc:
+        print(f"community {args.action} failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="web-express", description="Free, local web search for AI agents.")
     parser.add_argument("--version", action="version", version=f"web-express {__version__}")
@@ -487,6 +632,35 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("action", choices=("stats", "clear", "remove"))
     index.add_argument("url", nargs="?")
     index.add_argument("--yes", action="store_true", help="confirm clear")
+
+    pack = commands.add_parser("pack", help="build, install, list or remove corpus packs")
+    pack.add_argument("action", choices=("list", "install", "remove", "build"))
+    pack.add_argument("target", nargs="?", default="", help="pack name, or the file or https address to install")
+    pack.add_argument("--sha256", help="install: refuse the pack unless it has this checksum")
+    pack.add_argument("--urls", help="build: a file with one address per line")
+    pack.add_argument("--title", default="")
+    pack.add_argument("--licence", default="", help="build: the licence the pages may be shared under")
+    pack.add_argument("--attribution", default="", help="build: who to credit")
+    pack.add_argument("--source", default="")
+    pack.add_argument("--output", help="build: where to write the pack file")
+
+    ranks = commands.add_parser("authority", help="install or inspect the site-ranking data")
+    ranks.add_argument("action", choices=("install", "status"))
+    ranks.add_argument("--top", type=int, default=1_000_000, help="how many of the best-linked sites to keep")
+
+    shared = commands.add_parser("community", help="propose addresses and build or install shared shards")
+    shared.add_argument("action", choices=("export", "select", "build", "install"))
+    shared.add_argument("paths", nargs="+", help="export: output file; select: nomination files; build: address file; install: manifest")
+    shared.add_argument("--limit", type=int, default=5000, help="export: most addresses to write")
+    shared.add_argument("--output", help="select: address file to write; build: folder for shards")
+    shared.add_argument("--quorum", type=int, default=2, help="contributors that must propose an address")
+    shared.add_argument("--per-site", type=int, default=200, help="most addresses accepted from one site")
+    shared.add_argument("--max-site-rank", type=int, default=1_000_000)
+    shared.add_argument("--blocked", help="select: file of addresses or sites never to include")
+    shared.add_argument("--name", default="")
+    shared.add_argument("--licence", default="")
+    shared.add_argument("--attribution", default="")
+    shared.add_argument("--shard-size", type=int, default=1000)
     return parser
 
 
@@ -498,7 +672,8 @@ def main(argv: list[str] | None = None) -> int:
         server.main()
         return 0
     handler = {"setup": cmd_setup, "status": cmd_status, "init": cmd_init, "search": cmd_search,
-               "fetch": cmd_fetch, "index": cmd_index}[args.command]
+               "fetch": cmd_fetch, "index": cmd_index, "pack": cmd_pack, "authority": cmd_authority,
+               "community": cmd_community}[args.command]
     return handler(args)
 
 

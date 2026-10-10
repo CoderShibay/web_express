@@ -181,3 +181,53 @@ def test_init_exit_code_reports_problems(tmp_path, monkeypatch, capsys):
     assert cli.main(["init", "--client", "cursor"]) == 1 and "skipped" in capsys.readouterr().out
     (tmp_path / ".cursor" / "mcp.json").write_text("{}")
     assert cli.main(["init", "--client", "cursor"]) == 0
+
+
+def test_pack_and_community_commands_work_end_to_end(tmp_path, monkeypatch, capsys):
+    from web_express import packs
+    from web_express.extract import Document
+    from web_express.index import LocalIndex, default_path
+
+    text = "A real article with enough words to be worth keeping in an index. " * 6
+
+    async def fake_download(url, **kwargs):
+        return Document(url, "Title", text, None, "plain", False)
+
+    monkeypatch.setattr(packs, "download", fake_download)
+    monkeypatch.setattr(packs, "extract", lambda document: document)
+    monkeypatch.setattr(packs.asyncio, "sleep", lambda seconds: _nothing())
+
+    urls = tmp_path / "urls.txt"
+    urls.write_text("# my list\nhttps://one.example/a\nhttps://two.example/b\n")
+    out = tmp_path / "demo.pack"
+    assert cli.main(["pack", "build", "demo"]) == 1  # no licence, no pack
+    assert cli.main(["pack", "build", "demo", "--urls", str(urls), "--title", "Demo", "--licence", "CC0-1.0",
+                     "--attribution", "Me", "--output", str(out)]) == 0
+    assert cli.main(["pack", "install", str(out), "--sha256", "0" * 64]) == 1
+    assert cli.main(["pack", "install", str(out)]) == 0
+    capsys.readouterr()
+    assert cli.main(["pack", "list"]) == 0 and "demo: Demo | 2 pages | CC0-1.0 | Me" in capsys.readouterr().out
+    assert cli.status()["packs"] == ["demo (2 pages, CC0-1.0)"]
+    assert cli.main(["pack", "remove", "demo"]) == 0 and packs.installed() == []
+
+    store = LocalIndex(default_path())
+    for url in ("https://one.example/a", "https://two.example/b", "https://wiki.corp/private"):
+        store.add(Document(url, "Title", text, None, "plain", False))
+    store.close()
+    mine, theirs, chosen = tmp_path / "mine.txt", tmp_path / "theirs.txt", tmp_path / "chosen.txt"
+    assert cli.main(["community", "export", str(mine)]) == 0
+    assert sorted(mine.read_text().split()) == ["https://one.example/a", "https://two.example/b"]
+    theirs.write_text("https://one.example/a\n")
+    assert cli.main(["community", "select", str(mine), str(theirs), "--output", str(chosen)]) == 0
+    assert chosen.read_text().split() == ["https://one.example/a"]
+    release = tmp_path / "release"
+    assert cli.main(["community", "build", str(chosen), "--name", "pilot", "--licence", "CC0-1.0",
+                     "--attribution", "Us", "--output", str(release)]) == 0
+    assert cli.main(["community", "install", str(release / "manifest.json")]) == 0
+    assert [p.name for p in packs.installed()] == ["pilot-0001"]
+    assert cli.main(["community", "install", str(tmp_path / "missing.json")]) == 1
+    assert cli.main(["authority", "status"]) == 0 and "not installed" in capsys.readouterr().out
+
+
+async def _nothing():
+    return None

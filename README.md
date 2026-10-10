@@ -7,7 +7,8 @@ One `search` call returns the results **and** the passages of each page that
 match the query, quoted verbatim with character offsets, so an agent rarely
 needs a second call to read a page.
 
-> Status: early. Steps 1 to 5 of the plan below are done. It is not yet published
+> Status: early. The tooling for all seven steps of the plan below is built.
+> No pack or shared index has been published yet. It is not yet published
 > to a package index, so install from a copy of this folder.
 
 ## Tools
@@ -71,6 +72,9 @@ written but has not been tested on Windows yet.
 | `web-express search "query"` | Searches from the terminal. `--category`, `--freshness`, `--json`. |
 | `web-express fetch URL` | Reads a page from the terminal. `--query`, `--refresh`. |
 | `web-express index stats` | Shows the local index. Also `clear --yes` and `remove URL`. |
+| `web-express pack ...` | `build`, `install`, `list`, `remove` corpus packs. |
+| `web-express authority install` | Downloads the site-ranking data. `status` shows it. |
+| `web-express community ...` | `export`, `select`, `build`, `install` for a shared index. |
 
 ## Ranking by meaning
 
@@ -94,6 +98,54 @@ Every page web_express reads is stored in a private SQLite file,
 - If a page cannot be fetched and an older copy is stored, the older copy is used.
 - `fetch(url, refresh=True)` always reads from the network.
 - The oldest pages are dropped once the index passes 20,000 pages.
+
+## Corpus packs
+
+A pack is a ready-made, searchable collection of pages in one file: official
+documentation, open-access papers, anything that may be redistributed.
+Installing one makes its pages searchable offline at once, by words and by
+meaning. Every result from a pack carries the pack's licence and attribution.
+
+```bash
+web-express pack build python-docs --urls urls.txt --title "Python docs" \
+    --licence "PSF-2.0" --attribution "Python Software Foundation"
+web-express pack install python-docs.pack --sha256 <checksum>
+web-express pack list
+```
+
+Building fetches one page at a time with a pause between requests to the same
+site. A pack from someone else is opened read-only and refused if it holds
+anything beyond the expected tables. Only install packs from people you trust:
+the checks stop a pack from damaging your computer, not from containing
+misleading text.
+
+## Site ranking
+
+`web-express authority install` downloads the best-linked million sites from
+[Common Crawl's web graph](https://commoncrawl.org/web-graphs) (about 30 MB)
+into a small local file. Search then gives a slight preference to well-linked
+sites and reports each result's `site_rank`. Optional; without it nothing changes.
+
+## A shared index
+
+The long-term aim is an open index anyone can download, built by its users.
+The tooling for that is here; no shared index has been published yet.
+
+1. `web-express community export mine.txt` writes addresses from your local
+   index to a file. Addresses only: no searches, dates or page text, and never
+   one that carries a credential or points inside a private network. Nothing is
+   sent anywhere; you choose whether to share the file.
+2. `web-express community select a.txt b.txt c.txt --output chosen.txt` keeps
+   addresses proposed by several contributors, from well-linked sites, with a
+   cap per site.
+3. `web-express community build chosen.txt --name pilot --licence ... --attribution ... --output release/`
+   fetches and embeds every page itself, cuts the result into shards, and
+   writes a manifest with each shard's checksum.
+4. `web-express community install release/manifest.json` installs the shards,
+   refusing any that does not match the manifest.
+
+Contributors propose addresses, never content, so nobody can plant text or
+vectors in the index.
 
 ## Settings
 
@@ -137,8 +189,8 @@ highlights. Stack Overflow answers arrive through its official API instead.
 3. **Done:** local semantic ranking with a small ONNX embedding model.
 4. **Done:** a persistent local index of everything fetched.
 5. **Done:** installer scripts and automatic agent configuration.
-6. Downloadable licence-clear corpus packs.
-7. A community-built open web index, grown in measured stages.
+6. **Tooling done:** corpus packs and site ranking. No pack has been published yet.
+7. **Tooling done:** address proposals, selection rules, shard builds with checksummed manifests. The first shared pilot has not been run.
 
 ## Licence
 
